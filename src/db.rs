@@ -791,7 +791,7 @@ impl DbManager {
         Ok(result)
     }
 
-    /// 标记所有已有消息为已读 (复用持久连接)
+    /// 标记所有已有消息为已读 (复用持久连接 + 复用表元数据构建)
     pub async fn mark_all_read(&self) -> Result<()> {
         // 克隆 Arc 引用传入 spawn_blocking
         let conn_arcs: Vec<(String, Arc<std::sync::Mutex<Connection>>)> = {
@@ -809,33 +809,16 @@ impl DbManager {
                 let conn = conn_arc.lock().map_err(|e| anyhow::anyhow!("conn lock: {}", e))?;
                 let db_prefix = db_name.trim_start_matches("message/").trim_end_matches(".db");
 
-                let mut stmt = match conn.prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND \
-                     (name LIKE 'ChatMsg_%' OR name LIKE 'MSG_%' OR name LIKE 'Chat_%')"
-                ) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?
-                    .filter_map(|r| r.ok()).collect();
-
+                // 复用 discover_msg_tables + build_single_table_meta (消除重复 PRAGMA)
+                let tables = discover_msg_tables(&conn);
                 for table in &tables {
-                    let wm_key = format!("{}::{}", db_prefix, table);
-                    let pragma = format!("PRAGMA table_info({})", table);
-                    let mut ps = match conn.prepare(&pragma) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let cols: Vec<String> = ps.query_map([], |r| r.get::<_, String>(1))?
-                        .filter_map(|r| r.ok()).collect();
-                    let id_col = cols.iter().find(|c| {
-                        c.eq_ignore_ascii_case("local_id") || c.eq_ignore_ascii_case("localId")
-                    }).cloned().unwrap_or_else(|| "rowid".to_string());
-
-                    let sql = format!("SELECT MAX({}) FROM [{}]", id_col, table);
-                    if let Ok(max_id) = conn.query_row(&sql, [], |row| row.get::<_, Option<i64>>(0)) {
-                        if let Some(id) = max_id {
-                            watermarks.insert(wm_key, id);
+                    if let Some(meta) = build_single_table_meta(&conn, table) {
+                        let wm_key = format!("{}::{}", db_prefix, table);
+                        let sql = format!("SELECT MAX({}) FROM [{}]", meta.id_col, table);
+                        if let Ok(max_id) = conn.query_row(&sql, [], |row| row.get::<_, Option<i64>>(0)) {
+                            if let Some(id) = max_id {
+                                watermarks.insert(wm_key, id);
+                            }
                         }
                     }
                 }

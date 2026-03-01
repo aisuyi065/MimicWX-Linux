@@ -145,9 +145,9 @@ su - wechat << 'USEREOF'
   # 等待微信窗口就绪 (轮询替代固定 sleep, 最多 60 秒)
   echo "[start.sh] 等待微信窗口就绪..."
   for _wait in $(seq 1 30); do
-    if xdotool search --name "微信" >/dev/null 2>&1 || \
-       xdotool search --name "WeChat" >/dev/null 2>&1 || \
-       xdotool search --name "Weixin" >/dev/null 2>&1; then
+    # 检查微信窗口 (替代 xdotool, 使用进程窗口检测)
+    if pgrep -x wechat >/dev/null 2>&1 && \
+       xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -q "0x"; then
       echo "[start.sh] ✅ 微信窗口已就绪 (${_wait}x2s)"
       break
     fi
@@ -167,26 +167,35 @@ su - wechat << 'USEREOF'
   websockify --web /usr/share/novnc 6080 localhost:5901 &
   echo "[start.sh] ✅ noVNC 已启动"
 
-  # 8) MimicWX
-  echo "[start.sh] 启动 MimicWX..."
-  RUST_LOG=mimicwx=info /usr/local/bin/mimicwx > /tmp/mimicwx.log 2>&1 &
-  MIMICWX_PID=$!
-  echo "[start.sh] ✅ MimicWX 已启动 (PID: $MIMICWX_PID)"
-
-  echo "=============================="
-  echo "MimicWX-Linux Ready!"
-  echo "noVNC: http://localhost:6080/vnc.html"
-  echo "API:   http://localhost:8899"
-  echo "=============================="
+  # 环境变量已保存到 ~/.dbus_env (供 MimicWX 使用)
 USEREOF
 
 # ============================================================
-# 容器保活 (PID 1)
-# 用 while+sleep 替代 exec tail, 更健壮
+# 8) MimicWX (heredoc 之外运行, 保留 stdin 用于控制台命令)
 # ============================================================
-echo "[start.sh] 容器启动完成, 进入保活循环"
-trap 'echo "[start.sh] 收到退出信号"; exit 0' TERM INT
+echo "=============================="
+echo "MimicWX-Linux Ready!"
+echo "noVNC: http://localhost:6080/vnc.html"
+echo "API:   http://localhost:8899"
+echo "=============================="
+
+# 重启循环: 退出码 42 = 重启请求
 while true; do
-  sleep 3600 &
-  wait $!
+  # 通过 su -c 运行, 加载已保存的环境变量, 保留 stdin
+  su - wechat -c '
+    source ~/.dbus_env 2>/dev/null
+    export RUST_LOG=mimicwx=info
+    exec /usr/local/bin/mimicwx
+  '
+  EXIT_CODE=$?
+  if [ "$EXIT_CODE" = "42" ]; then
+    echo "[start.sh] 🔄 MimicWX 重启中 (3秒后)..."
+    sleep 3
+    echo "[start.sh] 🔄 重新启动 MimicWX..."
+    continue
+  fi
+  echo "[start.sh] MimicWX 已退出 (code=$EXIT_CODE)"
+  break
 done
+
+echo "[start.sh] 容器退出"

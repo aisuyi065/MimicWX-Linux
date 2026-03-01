@@ -14,9 +14,11 @@
 - ⌨️ **X11 XTEST 输入注入** — 通过 XTEST 扩展直接注入键鼠事件，零 Synthetic 标记，原生X11窗口管理
 - 🔑 **GDB 自动密钥提取** — 在 `setCipherKey` 偏移处设断点，用户扫码登录后自动从寄存器捕获 32 字节 AES 密钥
 - 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发消息
-- 🔌 **REST + WebSocket API** — 提供完整的 HTTP API 和 WebSocket 实时推送，可对接 Yunzai 等机器人框架
+- 🔌 **REST + WebSocket API** — 完整的 HTTP API 和 WebSocket 实时推送 (30s 心跳保活)，CORS 全开放，可对接 Yunzai 等机器人框架
 - 🐳 **Docker 一键部署** — 多阶段构建 + Xvfb/VNC 虚拟桌面，开箱即用
 - 🔒 **Token 认证** — 支持 Bearer Token 认证保护 API 安全
+- 🖥️ **交互式控制台** — 支持 `/restart`、`/stop`、`/status`、`/refresh`、`/help` 命令，方向键切换历史命令
+- 💡 **自动弹性** — AT-SPI2 心跳自动重连、联系人定时刷新、优雅重启/关闭
 
 ---
 
@@ -47,8 +49,8 @@
 │  │  └────────────────────────────────────────────────────────────────┘   │ │
 │  │                                                                       │ │
 │  │  ┌── API 层 ──────────────────────────────────────────────────────┐   │ │
-│  │  │  api.rs: axum HTTP + WebSocket (OneBot-like 接口)               │   │ │
-│  │  │  main.rs: 启动编排 / 配置加载 / 消息循环                       │   │ │
+│  │  │  api.rs: axum HTTP + WebSocket (CORS + 心跳保活)                │   │ │
+│  │  │  main.rs: 启动编排 / 配置 / 消息循环 / 交互式控制台             │   │ │
 │  │  └────────────────────────────────────────────────────────────────┘   │ │
 │  └───────────────────────────────────────────────────────────────────────┘ │
 │                                                                           │
@@ -161,7 +163,7 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/status` | GET | 服务状态 (免认证) |
+| `/status` | GET | 服务状态 + DB/联系人/运行时间 (免认证) |
 | `/contacts` | GET | 联系人列表 (数据库) |
 | `/sessions` | GET | 会话列表 (优先数据库) |
 | `/messages/new` | GET | 新消息 (数据库增量) |
@@ -374,6 +376,28 @@ curl -X POST http://localhost:8899/listen \
 const ws = new WebSocket("ws://localhost:8899/ws?token=your-token")
 ws.onmessage = (e) => console.log(JSON.parse(e.data))
 ```
+
+---
+
+## 🖥️ 控制台命令
+
+通过 `docker attach mimicwx-linux` 进入交互式控制台：
+
+```
+> /help
+```
+
+| 命令 | 功能 |
+|------|------|
+| `/restart` | 优雅重启 MimicWX (微信不受影响，3s 后自动恢复) |
+| `/stop` | 正常关闭程序 |
+| `/status` | 显示运行时状态 |
+| `/refresh` | 手动刷新联系人缓存 |
+| `/help` | 显示帮助 |
+
+**快捷键**: `↑↓` 历史命令 · `←→` 移动光标 · `Ctrl+U` 清行 · `Ctrl+L` 清屏
+
+> 退出控制台但不停止容器: `Ctrl+P` 然后 `Ctrl+Q`
 
 ---
 

@@ -2,6 +2,8 @@ services:
   mimicwx:
     build: .
     container_name: mimicwx-linux
+    stdin_open: true # docker attach 需要 (-i)
+    tty: true # 终端模式 (-t)
     cap_add:
       - SYS_ADMIN # fanotify WAL 监听
       - SYS_PTRACE # GDB 密钥提取

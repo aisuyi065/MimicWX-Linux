@@ -50,6 +50,8 @@ pub struct AppState {
     pub db: Option<Arc<DbManager>>,
     /// API 认证 Token (None = 不启用认证)
     pub api_token: Option<String>,
+    /// 启动时间 (用于 uptime 计算)
+    pub start_time: std::time::Instant,
 }
 
 // =====================================================================
@@ -152,6 +154,14 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// 轻量伪随机 u16 (无需引入 rand crate, 用时间纳秒低位)
+fn rand_u16() -> u16 {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (t.subsec_nanos() ^ (t.as_millis() as u32)) as u16
+}
+
 // =====================================================================
 // 统一错误响应
 // =====================================================================
@@ -249,6 +259,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/status", get(get_status))
         .merge(protected)
+        .layer(tower_http::cors::CorsLayer::permissive()) // ⑩ CORS 支持
         .with_state(state)
 }
 
@@ -261,6 +272,9 @@ struct StatusResponse {
     status: String,
     version: String,
     listen_count: usize,
+    db_available: bool,
+    contacts: usize,
+    uptime_secs: u64,
 }
 
 #[derive(Deserialize)]
@@ -319,10 +333,15 @@ struct ListenResponse {
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let status = state.wechat.check_status().await;
     let listen_count = state.wechat.get_listen_list().await.len();
+    let db_available = state.db.is_some();
+    let contacts = if let Some(ref d) = state.db {
+        d.get_contacts().await.len()
+    } else { 0 };
+    let uptime_secs = state.start_time.elapsed().as_secs();
     Json(StatusResponse {
         status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
-        listen_count,
+        listen_count, db_available, contacts, uptime_secs,
     })
 }
 
@@ -415,7 +434,9 @@ async fn send_image(
     } else {
         "png"
     };
-    let tmp_path = format!("/tmp/mimicwx_img_{}.{}", std::process::id(), ext);
+    let tmp_path = format!("/tmp/mimicwx_img_{}_{:04x}.{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        rand_u16(), ext);
     {
         let mut f = std::fs::File::create(&tmp_path)
             .map_err(|e| ApiError::internal(format!("创建临时文件失败: {e}")))?;
@@ -588,14 +609,15 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.tx.subscribe();
     info!("🔌 WebSocket 连接建立");
 
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    ping_interval.tick().await; // 跳过首次
+
     loop {
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
                     Ok(text) => {
-                        if socket.send(Message::Text(text.into())).await.is_err() {
-                            break;
-                        }
+                        if socket.send(Message::Text(text.into())).await.is_err() { break; }
                     }
                     Err(_) => break,
                 }
@@ -603,8 +625,13 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Pong(_))) => {} // 心跳响应
                     _ => {}
                 }
+            }
+            _ = ping_interval.tick() => {
+                // ⑴ WebSocket 心跳: 每 30s 发 Ping
+                if socket.send(Message::Ping(vec![].into())).await.is_err() { break; }
             }
         }
     }

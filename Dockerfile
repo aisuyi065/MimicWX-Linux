@@ -48,7 +48,7 @@ RUN apt-get update && apt-get install -y \
     tigervnc-standalone-server tigervnc-common \
     novnc websockify \
     at-spi2-core \
-    xdotool xclip xautomation \
+    xclip x11-utils \
     wget curl sudo procps net-tools gpg \
     gdb python3 \
     libcap2-bin libatomic1 \

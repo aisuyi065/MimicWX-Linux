@@ -347,24 +347,8 @@ impl ChatWnd {
                     None => continue,
                 }
             };
-            let count = self.atspi.child_count(&msg_list).await;
-            if count <= 0 { continue; }
-
-            // 检查最后几条消息 (因为可能有系统消息插入)
-            let check_range = 3.min(count);
-            for i in (count - check_range)..count {
-                if let Some(child) = self.atspi.child_at(&msg_list, i).await {
-                    let name = self.atspi.name(&child).await;
-                    let trimmed = name.trim();
-                    // 匹配条件: 包含关系 + 长度差距不超过 2 倍 (避免短文本误匹配)
-                    let len_ok = !trimmed.is_empty()
-                        && trimmed.len() <= text.len() * 2 + 10
-                        && text.len() <= trimmed.len() * 2 + 10;
-                    if len_ok && (trimmed.contains(text) || text.contains(trimmed)) {
-                        info!("✅ [ChatWnd] 验证成功 (attempt {attempt}, item {i})");
-                        return true;
-                    }
-                }
+            if crate::wechat::verify_sent_in_list(&self.atspi, &msg_list, text, attempt).await {
+                return true;
             }
         }
         false

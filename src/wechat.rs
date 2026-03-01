@@ -660,10 +660,15 @@ impl WeChat {
             seen.insert(m.msg_id.clone());
         }
 
-        // 防止无限增长: 超过 500 条时只保留最近的消息 ID
+        // 防止无限增长: 超过 500 条时保留最近 200 条 (而非全部清空)
         if seen.len() > 500 {
-            // 用本次已获取的 new_msgs 重建 seen, 避免二次 AT-SPI 遍历
+            // 收集所有 ID 并保留后 200 个
+            let all_ids: Vec<String> = seen.iter().cloned().collect();
             seen.clear();
+            for id in all_ids.into_iter().rev().take(200) {
+                seen.insert(id);
+            }
+            // 确保本次新消息也在其中
             for m in &new_msgs {
                 seen.insert(m.msg_id.clone());
             }
@@ -806,24 +811,8 @@ impl WeChat {
                 tokio::time::sleep(ms(500)).await;
             }
             if let Some(msg_list) = self.find_message_list(app).await {
-                let count = self.atspi.child_count(&msg_list).await;
-                if count <= 0 { continue; }
-
-                // 检查最后 3 条消息 (可能有系统消息插入)
-                let check_start = (count - 3).max(0);
-                for i in check_start..count {
-                    if let Some(child) = self.atspi.child_at(&msg_list, i).await {
-                        let name = self.atspi.name(&child).await;
-                        let trimmed = name.trim();
-                        // 匹配条件: 包含关系 + 长度差距不超过 2 倍 (避免短文本误匹配)
-                        let len_ok = !trimmed.is_empty()
-                            && trimmed.len() <= text.len() * 2 + 10
-                            && text.len() <= trimmed.len() * 2 + 10;
-                        if len_ok && (trimmed.contains(text) || text.contains(trimmed)) {
-                            info!("✅ 验证成功 (attempt {attempt})");
-                            return true;
-                        }
-                    }
+                if verify_sent_in_list(&self.atspi, &msg_list, text, attempt).await {
+                    return true;
                 }
             }
         }
@@ -937,14 +926,45 @@ pub(crate) fn generate_msg_id(index: i32, msg_type: &str, sender: &str, content:
     format!("{:016x}", hasher.finish())
 }
 
-/// 判断文本是否是时间格式
+/// 判断文本是否是时间格式 (更严格: 要求冒号前后是数字)
 pub(crate) fn is_time_text(text: &str) -> bool {
     let text = text.trim();
-    if text.contains(':') && text.len() < 20 { return true; }
+    if text.len() > 25 || text.is_empty() { return false; }
+    // 数字:数字 格式 (如 "14:30", "下午 2:30", "2026/3/1 14:30")
+    if text.contains(':') {
+        let has_digit_colon = text.as_bytes().windows(3).any(|w| {
+            w[0].is_ascii_digit() && w[1] == b':' && w[2].is_ascii_digit()
+        });
+        if has_digit_colon { return true; }
+    }
     if text.contains("昨天") || text.contains("前天") || text.contains("星期") { return true; }
     if text.contains("年") && text.contains("月") { return true; }
     let days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "Yesterday"];
     days.iter().any(|d| text.contains(d))
+}
+
+/// 公共发送验证: 检查消息列表末尾是否包含指定文本
+///
+/// 被 WeChat::verify_sent 和 ChatWnd::verify_sent 共用, 消除 copy-paste
+pub(crate) async fn verify_sent_in_list(atspi: &AtSpi, msg_list: &NodeRef, text: &str, attempt: i32) -> bool {
+    let count = atspi.child_count(msg_list).await;
+    if count <= 0 { return false; }
+
+    let check_range = 3.min(count);
+    for i in (count - check_range)..count {
+        if let Some(child) = atspi.child_at(msg_list, i).await {
+            let name = atspi.name(&child).await;
+            let trimmed = name.trim();
+            let len_ok = !trimmed.is_empty()
+                && trimmed.len() <= text.len() * 2 + 10
+                && text.len() <= trimmed.len() * 2 + 10;
+            if len_ok && (trimmed.contains(text) || text.contains(trimmed)) {
+                info!("✅ 验证成功 (attempt {attempt})");
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn ms(n: u64) -> std::time::Duration {

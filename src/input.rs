@@ -54,6 +54,12 @@ pub struct InputEngine {
     max_keycode: Keycode,
     keysyms_per_keycode: u8,
     keysyms: Vec<u32>,
+    // 缓存的 X11 Atom (在 X11 Session 内永不变, 启动时一次性 intern)
+    atom_net_wm_name: u32,
+    atom_utf8_string: u32,
+    atom_net_client_list: u32,
+    atom_net_active_window: u32,
+    atom_net_close_window: u32,
 }
 
 impl InputEngine {
@@ -85,9 +91,20 @@ impl InputEngine {
         let keysyms_per_keycode = reply.keysyms_per_keycode;
         let keysyms: Vec<u32> = reply.keysyms.iter().map(|k| (*k).into()).collect();
 
+        // 一次性 intern 所有需要的 Atom (避免每次调用重复查询)
+        let atom_net_wm_name = conn.intern_atom(false, b"_NET_WM_NAME")?.reply()?.atom;
+        let atom_utf8_string = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+        let atom_net_client_list = conn.intern_atom(false, b"_NET_CLIENT_LIST")?.reply()?.atom;
+        let atom_net_active_window = conn.intern_atom(false, b"_NET_ACTIVE_WINDOW")?.reply()?.atom;
+        let atom_net_close_window = conn.intern_atom(false, b"_NET_CLOSE_WINDOW")?.reply()?.atom;
+
         info!("✅ X11 XTEST 就绪 (DISPLAY={display_env}, keycodes={min_keycode}~{max_keycode})");
 
-        Ok(Self { conn, screen_root, min_keycode, max_keycode, keysyms_per_keycode, keysyms })
+        Ok(Self {
+            conn, screen_root, min_keycode, max_keycode, keysyms_per_keycode, keysyms,
+            atom_net_wm_name, atom_utf8_string, atom_net_client_list,
+            atom_net_active_window, atom_net_close_window,
+        })
     }
 
     // =================================================================
@@ -389,12 +406,10 @@ impl InputEngine {
     /// `exact=true`: 精确匹配; `exact=false`: contains 匹配
     /// 返回匹配的 (window_id, window_name) 列表
     pub fn find_windows_by_title(&self, title: &str, exact: bool) -> Result<Vec<(u32, String)>> {
-        let wm_name_atom = self.conn.intern_atom(false, b"_NET_WM_NAME")?
-            .reply()?.atom;
-        let utf8_atom = self.conn.intern_atom(false, b"UTF8_STRING")?
-            .reply()?.atom;
-        let client_list_atom = self.conn.intern_atom(false, b"_NET_CLIENT_LIST")?
-            .reply()?.atom;
+        // 使用缓存的 Atom (启动时已 intern)
+        let wm_name_atom = self.atom_net_wm_name;
+        let utf8_atom = self.atom_utf8_string;
+        let client_list_atom = self.atom_net_client_list;
 
         // 优先: _NET_CLIENT_LIST (WM 托管的所有顶层窗口)
         let windows: Vec<u32> = if let Ok(reply) = self.conn.get_property(
@@ -450,8 +465,7 @@ impl InputEngine {
         let windows = self.find_windows_by_title(title, exact)?;
         if let Some((win, name)) = windows.first() {
             debug!("🖱️ 激活窗口: '{name}' (wid={win})");
-            let active_atom = self.conn.intern_atom(false, b"_NET_ACTIVE_WINDOW")?
-                .reply()?.atom;
+            let active_atom = self.atom_net_active_window;
             // _NET_ACTIVE_WINDOW: data[0]=source(1=app), data[1]=timestamp, data[2]=requestor
             let event = ClientMessageEvent {
                 response_type: xproto::CLIENT_MESSAGE_EVENT,
@@ -480,8 +494,7 @@ impl InputEngine {
         let windows = self.find_windows_by_title(title, false)?;
         if let Some((win, name)) = windows.first() {
             info!("🗑️ 关闭窗口: '{name}' (匹配 '{title}')");
-            let close_atom = self.conn.intern_atom(false, b"_NET_CLOSE_WINDOW")?
-                .reply()?.atom;
+            let close_atom = self.atom_net_close_window;
             let event = ClientMessageEvent {
                 response_type: xproto::CLIENT_MESSAGE_EVENT,
                 format: 32,

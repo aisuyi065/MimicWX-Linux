@@ -11,7 +11,9 @@ import fs from "node:fs/promises"
 import path from "node:path"
 
 const MIMICWX_URL = process.env.MIMICWX_URL || "http://localhost:8899"
-const MIMICWX_TOKEN = process.env.MIMICWX_TOKEN || ""
+// ↓↓↓ 在这里填写你的 Token (与 config.toml 中 [api] token 一致) ↓↓↓
+const MIMICWX_TOKEN = "62811901aaAA"
+// ↑↑↑ 如不需要认证留空即可, 也可通过环境变量 MIMICWX_TOKEN 覆盖 ↑↑↑
 const MIMICWX_WS = MIMICWX_URL.replace(/^http/, "ws") + "/ws" + (MIMICWX_TOKEN ? `?token=${encodeURIComponent(MIMICWX_TOKEN)}` : "")
 const RECONNECT_INTERVAL = 5000
 
@@ -210,6 +212,7 @@ Bot.adapter.push(
         const isGroup = data.chat && data.chat.includes("@chatroom")
         const user_id = data.talker || data.chat
         const group_id = isGroup ? data.chat : undefined
+        console.log(`[MimicWX DEBUG] user_id=${user_id} | talker=${data.talker} | chat=${data.chat}`)
         const bot = Bot[this.self_id]
 
         // 动态更新联系人/群映射 (确保 pickGroup/pickFriend 能找到正确的显示名)
