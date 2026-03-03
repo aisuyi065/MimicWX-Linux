@@ -254,10 +254,16 @@ impl DbManager {
             .filter_map(|c| c.as_os_str().to_str())
             .find(|s| s.starts_with("wxid_"))
             .map(|s| {
-                // 取 wxid_xxx 部分 (去掉 _c024 后缀)
-                if let Some(pos) = s.rfind("_c") {
-                    let suffix = &s[pos+2..];
-                    if suffix.chars().all(|c| c.is_ascii_digit()) {
+                // 去掉目录名中的设备后缀 (如 _c024, _ac17 等)
+                // wxid 本体一般为 wxid_xxxx 格式, 后缀由微信附加
+                if let Some(pos) = s.rfind('_') {
+                    let suffix = &s[pos+1..];
+                    // 后缀较短 (≤6字符) 且不以 wxid 开头 → 视为设备后缀
+                    if suffix.len() <= 6
+                        && suffix.len() >= 2
+                        && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+                        && !suffix.starts_with("wxid")
+                    {
                         return s[..pos].to_string();
                     }
                 }

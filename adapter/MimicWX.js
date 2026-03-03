@@ -248,8 +248,9 @@ Bot.adapter.push(
         }
 
         // 仅@模式: 群消息过滤 (非 @ 消息跳过, 私聊始终通过)
-        if (this.atOnlyMode && isGroup && !data.is_at_me) {
-          return
+        if (this.atOnlyMode && isGroup) {
+          Bot.makeLog("debug", `[atOnly] is_at_me=${data.is_at_me} at_list=${JSON.stringify(data.at_user_list)} content=${(data.content||"").slice(0,30)}`, this.self_id)
+          if (!data.is_at_me) return
         }
         const bot = Bot[this.self_id]
 
