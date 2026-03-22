@@ -211,7 +211,8 @@ struct TableMeta {
 }
 
 pub struct DbManager {
-    /// 32 字节原始密钥
+    /// 密钥 hex 字符串 (96 hex = 已派生, 64 hex = 原始)
+    key_hex: String,
     key_bytes: Vec<u8>,
     /// 数据库存储目录 (如 /home/wechat/.local/share/weixin/db_storage/)
     db_dir: PathBuf,
@@ -244,7 +245,8 @@ impl DbManager {
     pub fn new(key_hex: String, db_dir: PathBuf) -> Result<Self> {
         let key_bytes = hex_to_bytes(&key_hex)
             .context("密钥 hex 格式错误")?;
-        anyhow::ensure!(key_bytes.len() == 32, "密钥长度必须为 32 字节, 实际: {}", key_bytes.len());
+        anyhow::ensure!(key_bytes.len() == 32 || key_bytes.len() == 48,
+            "密钥长度必须为 32 或 48 字节, 实际: {}", key_bytes.len());
 
         info!("📦 DbManager 初始化: db_dir={}", db_dir.display());
 
@@ -283,7 +285,7 @@ impl DbManager {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if is_message_db(&name) {
                         let rel_path = format!("message/{}", name);
-                        match Self::open_db(&key_bytes, &db_dir, &rel_path) {
+                        match Self::open_db(&key_hex, &key_bytes, &db_dir, &rel_path) {
                             Ok(conn) => {
                                 info!("🔗 {} 持久连接已建立", name);
                                 conns.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
@@ -305,6 +307,7 @@ impl DbManager {
         let (wal_tx, _) = tokio::sync::broadcast::channel::<()>(64);
         let (sent_tx, _) = tokio::sync::broadcast::channel::<String>(32);
         Ok(Self {
+            key_hex: key_hex.clone(),
             key_bytes,
             db_dir,
             self_wxid,
@@ -324,38 +327,67 @@ impl DbManager {
     // 数据库连接 (同步, 在 spawn_blocking 中调用)
     // =================================================================
 
+    /// 从 JSON 映射文件查找数据库专属密钥
+    fn lookup_db_key(db_name: &str) -> Option<String> {
+        let json_path = "/tmp/wechat_keys.json";
+        let content = std::fs::read_to_string(json_path).ok()?;
+        let map: std::collections::HashMap<String, String> =
+            serde_json::from_str(&content).ok()?;
+        // 精确匹配
+        if let Some(key) = map.get(db_name) {
+            return Some(key.clone());
+        }
+        // 文件名匹配
+        let basename = std::path::Path::new(db_name)
+            .file_name().and_then(|f| f.to_str()).unwrap_or("");
+        for (k, v) in &map {
+            if k.ends_with(basename) { return Some(v.clone()); }
+        }
+        None
+    }
+
     /// 打开加密数据库 (只读模式)
-    fn open_db(key_bytes: &[u8], db_dir: &Path, db_name: &str) -> Result<Connection> {
+    fn open_db(key_hex: &str, key_bytes: &[u8], db_dir: &Path, db_name: &str) -> Result<Connection> {
         let path = db_dir.join(db_name);
         anyhow::ensure!(path.exists(), "数据库不存在: {}", path.display());
 
-        // WAL 模式下必须用 READ_WRITE 才能读到 WAL 中未 checkpoint 的新数据
-        // 配合 PRAGMA query_only=ON 防止意外写入
+        // 查找此数据库的专属密钥, 否则用默认密钥
+        let (actual_hex, actual_bytes) = if let Some(db_key) = Self::lookup_db_key(db_name) {
+            let bytes = hex_to_bytes(&db_key).unwrap_or_default();
+            (db_key, bytes)
+        } else {
+            (key_hex.to_string(), key_bytes.to_vec())
+        };
+
         let conn = Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ).with_context(|| format!("打开数据库失败: {}", path.display()))?;
 
-        // 通过 FFI 调用 sqlite3_key() 传递 raw key
-        let rc = unsafe {
-            let handle = conn.handle();
-            sqlite3_key(
-                handle as *mut std::ffi::c_void,
-                key_bytes.as_ptr(),
-                key_bytes.len() as std::ffi::c_int,
-            )
-        };
-        anyhow::ensure!(rc == 0, "sqlite3_key() 失败, rc={}", rc);
+        if actual_bytes.len() == 48 {
+            // 已派生密钥: PRAGMA key = "x'<96hex>'" 跳过 PBKDF2
+            let pragma = format!("PRAGMA key = \"x'{}'\";", actual_hex);
+            conn.execute_batch(&pragma)
+                .with_context(|| format!("PRAGMA key 失败: {}", db_name))?;
+        } else {
+            // 原始密钥: sqlite3_key() + PBKDF2 派生
+            let rc = unsafe {
+                let handle = conn.handle();
+                sqlite3_key(
+                    handle as *mut std::ffi::c_void,
+                    actual_bytes.as_ptr(),
+                    actual_bytes.len() as std::ffi::c_int,
+                )
+            };
+            anyhow::ensure!(rc == 0, "sqlite3_key() 失败, rc={}", rc);
+        }
 
         conn.execute_batch("PRAGMA cipher_compatibility = 4;")?;
-        // 安全防护: 不触发 checkpoint, 不写入数据
         conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")?;
         conn.execute_batch("PRAGMA query_only = ON;")?;
-        // 防御性: 遇到写锁时等待最多 5 秒, 而非直接报错
         conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
 
-        // 验证解密成功
         let count: i32 = conn.query_row(
             "SELECT count(*) FROM sqlite_master", [], |row| row.get(0),
         ).with_context(|| format!("数据库解密验证失败: {}", db_name))?;
@@ -377,7 +409,7 @@ impl DbManager {
                         if is_message_db(&name) {
                             let rel_path = format!("message/{}", name);
                             if !guard.contains_key(&rel_path) {
-                                if let Ok(conn) = Self::open_db(&self.key_bytes, &self.db_dir, &rel_path) {
+                                if let Ok(conn) = Self::open_db(&self.key_hex, &self.key_bytes, &self.db_dir, &rel_path) {
                                     info!("🔗 {} 持久连接已建立", name);
                                     guard.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
                                 }
@@ -398,6 +430,7 @@ impl DbManager {
     /// 加载/刷新联系人缓存 (spawn_blocking 中执行 DB 查询)
     pub async fn refresh_contacts(&self) -> Result<usize> {
         let key = self.key_bytes.clone();
+        let kh = self.key_hex.clone();
         let dir = self.db_dir.clone();
         let conn_mutex = Arc::clone(&self.contact_conn);
 
@@ -405,7 +438,7 @@ impl DbManager {
             // 复用或创建持久连接
             let mut guard = conn_mutex.lock().map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
             if guard.is_none() {
-                *guard = Some(Self::open_db(&key, &dir, "contact/contact.db")?);
+                *guard = Some(Self::open_db(&kh, &key, &dir, "contact/contact.db")?);  
                 info!("🔗 contact.db 持久连接已建立");
             }
             let conn = guard.as_ref().unwrap();
@@ -538,6 +571,7 @@ impl DbManager {
     /// 获取会话列表
     pub async fn get_sessions(&self) -> Result<Vec<DbSessionInfo>> {
         let key = self.key_bytes.clone();
+        let kh = self.key_hex.clone();
         let dir = self.db_dir.clone();
         let conn_mutex = Arc::clone(&self.session_conn);
 
@@ -545,7 +579,7 @@ impl DbManager {
             // 复用或创建持久连接
             let mut guard = conn_mutex.lock().map_err(|e| anyhow::anyhow!("session_conn lock: {}", e))?;
             if guard.is_none() {
-                *guard = Some(Self::open_db(&key, &dir, "session/session.db")?);
+                *guard = Some(Self::open_db(&kh, &key, &dir, "session/session.db")?);  
                 info!("🔗 session.db 持久连接已建立");
             }
             let conn = guard.as_ref().unwrap();

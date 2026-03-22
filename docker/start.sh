@@ -1,6 +1,6 @@
 #!/bin/bash
 # MimicWX-Linux 容器启动脚本
-# 启动顺序: D-Bus → VNC → AT-SPI2 → WeChat → GDB密钥提取 → noVNC → MimicWX
+# 启动顺序: D-Bus → VNC → AT-SPI2 → WeChat → 密钥内存扫描 → noVNC → MimicWX
 
 set +e  # 不因单个命令失败而退出
 
@@ -32,28 +32,18 @@ su - wechat -c '
 '
 
 # ============================================================
-# GDB 密钥提取监视器 (root 后台)
-# 等待 WeChat PID 文件出现后自动 attach 提取密钥
+# 密钥提取监视器 (内存扫描方式, root 后台)
+# 等待微信登录后自动扫描进程内存提取数据库密钥
 # ============================================================
 if [ ! -f /tmp/wechat_key.txt ]; then
   setsid bash -c '
-    echo "[GDB] 密钥提取监视器启动, 等待 WeChat PID..."
-    for _i in $(seq 1 90); do
-      [ -f /tmp/wechat.pid ] && break
-      sleep 1
-    done
-    if [ -f /tmp/wechat.pid ]; then
-      WECHAT_PID=$(cat /tmp/wechat.pid)
-      echo "[GDB] 检测到 WeChat (PID: $WECHAT_PID), 开始提取密钥..."
-      sleep 5
-      gdb -batch -nx -p "$WECHAT_PID" -x /usr/local/bin/extract_key.py \
-        > /tmp/gdb_extract.log 2>&1 || true
-      echo "[GDB] 密钥提取完成, 详见 /tmp/gdb_extract.log"
-    else
-      echo "[GDB] ❌ 超时: 未找到 WeChat PID"
-    fi
+    echo "[extract_key] 密钥提取监视器启动 (内存扫描模式)"
+    python3 /usr/local/bin/extract_key.py \
+      > /tmp/extract_key.log 2>&1 || true
+    echo "[extract_key] 密钥提取完成, 详见 /tmp/extract_key.log"
   ' &
 fi
+
 
 # ============================================================
 # 1-8) 用户空间服务 (wechat 用户)

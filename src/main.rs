@@ -231,14 +231,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ⑥ 读取 GDB 提取的数据库密钥 + 初始化 DbManager
+    // ⑥ 读取数据库密钥 (内存扫描提取) + 初始化 DbManager
     let key_path = "/tmp/wechat_key.txt";
     for i in 0..10 {
         if std::path::Path::new(key_path).exists() {
             break;
         }
         if i == 0 {
-            info!("🔑 等待 GDB 提取密钥...");
+            info!("🔑 等待密钥提取...");
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -246,8 +246,8 @@ async fn main() -> Result<()> {
     let db_manager: Option<Arc<db::DbManager>> = match std::fs::read_to_string(key_path) {
         Ok(key) => {
             let key = key.trim().to_string();
-            if key.len() == 64 {
-                info!("🔑 数据库密钥已获取 ({}...{})", &key[..8], &key[56..]);
+            if key.len() == 96 || key.len() == 64 {
+                info!("🔑 数据库密钥已获取 ({}...{}) [{}hex]", &key[..8], &key[key.len()-8..], key.len());
 
                 // 查找数据库目录
                 let db_dir = find_db_dir();
