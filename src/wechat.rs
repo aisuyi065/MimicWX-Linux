@@ -51,6 +51,26 @@ pub struct SessionInfo {
 // WeChat 结构
 // =====================================================================
 
+/// 缓存的 AT-SPI 节点引用 (带 TTL)
+struct CachedNode {
+    node: NodeRef,
+    cached_at: tokio::time::Instant,
+}
+
+impl CachedNode {
+    fn new(node: NodeRef) -> Self {
+        Self { node, cached_at: tokio::time::Instant::now() }
+    }
+
+    fn get(&self, ttl_secs: u64) -> Option<&NodeRef> {
+        if self.cached_at.elapsed() < std::time::Duration::from_secs(ttl_secs) {
+            Some(&self.node)
+        } else {
+            None
+        }
+    }
+}
+
 pub struct WeChat {
     atspi: Arc<AtSpi>,
     /// 独立聊天窗口集合 (who → ChatWnd)
@@ -59,6 +79,10 @@ pub struct WeChat {
     pub current_chat: Mutex<Option<String>>,
     /// @ 输入流程每步延迟 (ms, 来自 config.toml, 支持热更新)
     at_delay_ms: std::sync::atomic::AtomicU64,
+    /// 缓存: 微信应用节点 (TTL 30s)
+    cached_app: Mutex<Option<CachedNode>>,
+    /// 缓存: 会话列表节点 (TTL 10s)
+    cached_session_list: Mutex<Option<CachedNode>>,
 }
 
 impl WeChat {
@@ -68,6 +92,8 @@ impl WeChat {
             listen_windows: Mutex::new(HashMap::new()),
             current_chat: Mutex::new(None),
             at_delay_ms: std::sync::atomic::AtomicU64::new(at_delay_ms),
+            cached_app: Mutex::new(None),
+            cached_session_list: Mutex::new(None),
         }
     }
 
@@ -100,8 +126,11 @@ impl WeChat {
         }
     }
 
-    /// 触发 AT-SPI2 重连
+    /// 触发 AT-SPI2 重连 (清空缓存)
     pub async fn try_reconnect(&self) -> bool {
+        // 重连后清空所有缓存节点 (旧节点引用失效)
+        *self.cached_app.lock().await = None;
+        *self.cached_session_list.lock().await = None;
         self.atspi.reconnect().await
     }
 
@@ -109,17 +138,32 @@ impl WeChat {
     // 控件查找
     // =================================================================
 
-    /// 在 AT-SPI2 Registry 中查找微信应用
+    /// 在 AT-SPI2 Registry 中查找微信应用 (带 30s TTL 缓存)
     pub async fn find_app(&self) -> Option<NodeRef> {
+        // 检查缓存
+        {
+            let cache = self.cached_app.lock().await;
+            if let Some(ref cached) = *cache {
+                if let Some(node) = cached.get(30) {
+                    return Some(node.clone());
+                }
+            }
+        }
+
+        // 缓存未命中, 重新查找
         if let Some(app) = self.scan_registry().await {
+            *self.cached_app.lock().await = Some(CachedNode::new(app.clone()));
             return Some(app);
         }
         debug!("Registry 未找到微信, 尝试重连...");
         if self.atspi.reconnect().await {
             if let Some(app) = self.scan_registry().await {
+                *self.cached_app.lock().await = Some(CachedNode::new(app.clone()));
                 return Some(app);
             }
         }
+        // 查找失败, 清空缓存
+        *self.cached_app.lock().await = None;
         None
     }
 
@@ -154,8 +198,18 @@ impl WeChat {
         }).await
     }
 
-    /// 会话列表 — DFS 查找 [list] name='Chats'
+    /// 会话列表 — DFS 查找 [list] name='Chats' (带 10s TTL 缓存)
     pub async fn find_session_list(&self, app: &NodeRef) -> Option<NodeRef> {
+        // 检查缓存
+        {
+            let cache = self.cached_session_list.lock().await;
+            if let Some(ref cached) = *cache {
+                if let Some(node) = cached.get(10) {
+                    return Some(node.clone());
+                }
+            }
+        }
+
         let result = self.atspi.find_dfs(app, &|role, name| {
             if role == "list" && (name.contains("Chats") || name.contains("会话")) {
                 SearchAction::Found
@@ -163,8 +217,9 @@ impl WeChat {
                 SearchAction::Recurse
             }
         }, 0, 18, 20).await;
-        if result.is_some() {
+        if let Some(ref node) = result {
             debug!("[find_session_list] 找到会话列表");
+            *self.cached_session_list.lock().await = Some(CachedNode::new(node.clone()));
         }
         result
     }
@@ -385,7 +440,20 @@ impl WeChat {
 
         // Ctrl+F 打开搜索
         engine.key_combo("ctrl+f").await?;
-        tokio::time::sleep(ms(500)).await;
+        // 轮询等待搜索输入框出现 (替代固定 500ms)
+        wait_for(&self.atspi, &app, 800, 50,
+            |atspi, app| {
+                let atspi = atspi.clone();
+                let app = app.clone();
+                async move {
+                    atspi.find_dfs(&app, &|role, _| {
+                        if role == "entry" || role == "text" {
+                            SearchAction::Found
+                        } else { SearchAction::Recurse }
+                    }, 0, 18, 20).await.is_some()
+                }
+            }
+        ).await;
 
         // 清除可能的旧搜索内容
         engine.key_combo("ctrl+a").await?;
@@ -393,7 +461,21 @@ impl WeChat {
 
         // 粘贴搜索关键词
         engine.paste_text(who).await?;
-        tokio::time::sleep(ms(1500)).await;
+        // 轮询等待搜索结果出现 (替代固定 1500ms, 最多等 2s)
+        wait_for(&self.atspi, &app, 2000, 100,
+            |atspi, app| {
+                let atspi = atspi.clone();
+                let app = app.clone();
+                async move {
+                    // 搜索结果出现时会有新的 list item
+                    atspi.find_dfs(&app, &|role, name| {
+                        if role == "list" && !name.contains("Chats") && !name.contains("会话") && !name.is_empty() {
+                            SearchAction::Found
+                        } else { SearchAction::Recurse }
+                    }, 0, 18, 20).await.is_some()
+                }
+            }
+        ).await;
 
         // 选择第一个搜索结果 (Enter)
         engine.press_enter().await?;
@@ -415,7 +497,20 @@ impl WeChat {
 
         // Esc 关闭搜索框 (借鉴 wxauto _refresh)
         engine.press_key("Escape").await?;
-        tokio::time::sleep(ms(500)).await;
+        // 轮询等待消息列表恢复 (替代固定 500ms)
+        wait_for(&self.atspi, &app, 800, 50,
+            |atspi, app| {
+                let atspi = atspi.clone();
+                let app = app.clone();
+                async move {
+                    atspi.find_dfs(&app, &|role, name| {
+                        if role == "list" && (name.contains("消息") || name.contains("Messages")) {
+                            SearchAction::Found
+                        } else { SearchAction::Recurse }
+                    }, 0, 18, 20).await.is_some()
+                }
+            }
+        ).await;
 
         // 验证是否切换成功
         if self.find_message_list(&app).await.is_some() {

@@ -12,8 +12,13 @@
 import re, os, sys, time, json, struct, hashlib
 import hmac as hmac_mod
 
-KEY_FILE = "/tmp/wechat_key.txt"
-KEY_JSON_FILE = "/tmp/wechat_keys.json"
+# 持久化路径 (避免 docker restart 丢失)
+KEY_DIR = "/home/wechat/.cache"
+KEY_FILE = os.path.join(KEY_DIR, "wechat_key.txt")
+KEY_JSON_FILE = os.path.join(KEY_DIR, "wechat_keys.json")
+# 兼容旧路径 (MimicWX 可能从 /tmp 读取)
+KEY_FILE_COMPAT = "/tmp/wechat_key.txt"
+KEY_JSON_COMPAT = "/tmp/wechat_keys.json"
 KEY_PATTERN = rb"x'([0-9a-fA-F]{96})'"
 SCAN_INTERVAL = 3
 MAX_WAIT = 300
@@ -161,20 +166,21 @@ def match_keys_to_dbs(keys, db_dir):
     return matched
 
 def save_keys(matched, all_keys):
-    """保存匹配结果"""
-    # 保存所有匹配的 {db: key} 映射
+    """保存匹配结果 (同时写入持久化路径和兼容路径)"""
+    os.makedirs(KEY_DIR, exist_ok=True)
     mapping = {}
     for db, k in matched.items():
         mapping[db] = k['raw_key']
     
-    with open(KEY_JSON_FILE, 'w') as f:
-        json.dump(mapping, f, indent=2)
+    for jpath in [KEY_JSON_FILE, KEY_JSON_COMPAT]:
+        with open(jpath, 'w') as f:
+            json.dump(mapping, f, indent=2)
     
-    # 兼容旧格式: 保存第一个密钥的 raw_key
     if matched:
         first_key = list(matched.values())[0]
-        with open(KEY_FILE, 'w') as f:
-            f.write(first_key['raw_key'])
+        for kpath in [KEY_FILE, KEY_FILE_COMPAT]:
+            with open(kpath, 'w') as f:
+                f.write(first_key['raw_key'])
 
 def main():
     print("[extract_key] 🔑 微信密钥提取脚本启动 (内存扫描 + HMAC 验证)")
@@ -230,6 +236,8 @@ def main():
             save_keys(matched, keys)
             print(f"[extract_key] ✅ 成功匹配 {len(matched)} 个数据库的密钥!")
             print(f"[extract_key] 📝 密钥已保存到 {KEY_FILE} 和 {KEY_JSON_FILE}")
+            # 延迟重扫: 微信可能在登录后才创建部分 DB (如 message_0.db)
+            rescan_for_new_dbs(pid, db_dir, matched)
             return
         else:
             # 密钥找到但没匹配到数据库 (可能数据库还没创建完)
@@ -242,12 +250,65 @@ def main():
                 # 超过 30 秒还没匹配到, 直接保存
                 print(f"[extract_key] ⚠️ 未匹配到数据库, 保存原始密钥")
                 save_keys({}, keys)
-                with open(KEY_FILE, 'w') as f:
-                    f.write(keys[0]['raw_key'])
+                for kpath in [KEY_FILE, KEY_FILE_COMPAT]:
+                    with open(kpath, 'w') as f:
+                        f.write(keys[0]['raw_key'])
                 return
 
     print(f"[extract_key] ❌ 超时 ({MAX_WAIT}s), 未找到密钥")
     sys.exit(1)
+
+def rescan_for_new_dbs(pid, db_dir, initial_matched):
+    """延迟重扫: 监控 db_storage 30s, 有新 .db 就重新提取并匹配"""
+    initial_dbs = set(initial_matched.keys())
+    print(f"[extract_key] 🔄 开始监控新数据库 (30s)...")
+    
+    for i in range(6):  # 6 x 5s = 30s
+        time.sleep(5)
+        
+        # 检查进程是否存活
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print("[extract_key] ⚠️ 微信进程已退出, 停止监控")
+            return
+        
+        # 扫描当前所有 DB
+        current_dbs = set()
+        for root, dirs, files in os.walk(db_dir):
+            for f in files:
+                if f.endswith('.db') and not f.endswith(('-wal', '-shm')):
+                    rel = os.path.relpath(os.path.join(root, f), db_dir)
+                    current_dbs.add(rel)
+        
+        new_dbs = current_dbs - initial_dbs
+        if not new_dbs:
+            continue
+        
+        print(f"[extract_key] 🆕 发现 {len(new_dbs)} 个新数据库: {', '.join(sorted(new_dbs))}")
+        
+        # 重新扫描内存 (新 DB 的密钥可能刚加载)
+        keys = scan_process_memory(pid)
+        if not keys:
+            continue
+        
+        unique = {}
+        for k in keys:
+            if k['raw_key'] not in unique:
+                unique[k['raw_key']] = k
+        keys = list(unique.values())
+        
+        # 重新匹配所有 DB
+        matched = match_keys_to_dbs(keys, db_dir)
+        if len(matched) > len(initial_matched):
+            save_keys(matched, keys)
+            new_count = len(matched) - len(initial_matched)
+            print(f"[extract_key] ✅ 更新: 新增 {new_count} 个密钥, 共 {len(matched)} 个")
+            initial_matched.update(matched)
+            initial_dbs = set(initial_matched.keys())
+    
+    print(f"[extract_key] 🔄 监控结束, 最终匹配 {len(initial_matched)} 个数据库")
+
 
 if __name__ == "__main__":
     main()

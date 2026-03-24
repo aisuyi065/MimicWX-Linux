@@ -35,7 +35,7 @@ su - wechat -c '
 # 密钥提取监视器 (内存扫描方式, root 后台)
 # 等待微信登录后自动扫描进程内存提取数据库密钥
 # ============================================================
-if [ ! -f /tmp/wechat_key.txt ]; then
+if [ ! -f /tmp/wechat_key.txt ] && [ ! -f /home/wechat/.cache/wechat_key.txt ]; then
   setsid bash -c '
     echo "[extract_key] 密钥提取监视器启动 (内存扫描模式)"
     python3 /usr/local/bin/extract_key.py \

@@ -60,6 +60,8 @@ pub struct InputEngine {
     atom_net_client_list: u32,
     atom_net_active_window: u32,
     atom_net_close_window: u32,
+    atom_clipboard: u32,
+    atom_targets: u32,
 }
 
 impl InputEngine {
@@ -97,6 +99,8 @@ impl InputEngine {
         let atom_net_client_list = conn.intern_atom(false, b"_NET_CLIENT_LIST")?.reply()?.atom;
         let atom_net_active_window = conn.intern_atom(false, b"_NET_ACTIVE_WINDOW")?.reply()?.atom;
         let atom_net_close_window = conn.intern_atom(false, b"_NET_CLOSE_WINDOW")?.reply()?.atom;
+        let atom_clipboard = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
+        let atom_targets = conn.intern_atom(false, b"TARGETS")?.reply()?.atom;
 
         info!("✅ X11 XTEST 就绪 (DISPLAY={display_env}, keycodes={min_keycode}~{max_keycode})");
 
@@ -104,6 +108,7 @@ impl InputEngine {
             conn, screen_root, min_keycode, max_keycode, keysyms_per_keycode, keysyms,
             atom_net_wm_name, atom_utf8_string, atom_net_client_list,
             atom_net_active_window, atom_net_close_window,
+            atom_clipboard, atom_targets,
         })
     }
 
@@ -271,6 +276,11 @@ impl InputEngine {
         let text_owned = text.to_string();
         let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
 
+        // 使用缓存的 Atom 值 (启动时已 intern, 避免每次重复查询)
+        let clipboard_atom = self.atom_clipboard;
+        let utf8_atom = self.atom_utf8_string;
+        let targets_atom_cached = self.atom_targets;
+
         // 同步通道: blocking thread 通知 ownership 已就绪
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -284,9 +294,10 @@ impl InputEngine {
                 .context("X11 clipboard 连接失败")?;
             let screen = &conn.setup().roots[screen_num];
 
-            let clipboard = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
-            let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
-            let targets_atom = conn.intern_atom(false, b"TARGETS")?.reply()?.atom;
+            // 复用缓存的 Atom, 无需重新 intern
+            let clipboard = clipboard_atom;
+            let utf8_string = utf8_atom;
+            let targets_atom = targets_atom_cached;
 
             // 隐藏窗口作为 clipboard owner
             let win = conn.generate_id()?;

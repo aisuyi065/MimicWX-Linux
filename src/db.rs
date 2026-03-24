@@ -218,6 +218,8 @@ pub struct DbManager {
     db_dir: PathBuf,
     /// 当前登录账号的 wxid (从 db_dir 路径提取, 用于判断自发消息)
     self_wxid: String,
+    /// ensure_msg_conns 空扫描计数 (用于抑制重复日志)
+    rescan_count: std::sync::atomic::AtomicU32,
     /// 当前账号的显示名 (从联系人库查询, 默认 "我")
     self_display_name: tokio::sync::RwLock<String>,
     /// 联系人缓存: username → ContactInfo
@@ -320,6 +322,7 @@ impl DbManager {
             table_meta_cache: std::sync::Mutex::new(HashMap::new()),
             wal_notify: wal_tx,
             sent_content_tx: sent_tx,
+            rescan_count: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -329,10 +332,7 @@ impl DbManager {
 
     /// 从 JSON 映射文件查找数据库专属密钥
     fn lookup_db_key(db_name: &str) -> Option<String> {
-        let json_path = "/tmp/wechat_keys.json";
-        let content = std::fs::read_to_string(json_path).ok()?;
-        let map: std::collections::HashMap<String, String> =
-            serde_json::from_str(&content).ok()?;
+        let map = Self::read_keys_json()?;
         // 精确匹配
         if let Some(key) = map.get(db_name) {
             return Some(key.clone());
@@ -346,28 +346,39 @@ impl DbManager {
         None
     }
 
-    /// 打开加密数据库 (只读模式)
-    fn open_db(key_hex: &str, key_bytes: &[u8], db_dir: &Path, db_name: &str) -> Result<Connection> {
-        let path = db_dir.join(db_name);
-        anyhow::ensure!(path.exists(), "数据库不存在: {}", path.display());
+    /// 读取 wechat_keys.json (优先持久化路径, 回退 /tmp)
+    fn read_keys_json() -> Option<std::collections::HashMap<String, String>> {
+        for path in &["/home/wechat/.cache/wechat_keys.json", "/tmp/wechat_keys.json"] {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(map) = serde_json::from_str(&content) {
+                    return Some(map);
+                }
+            }
+        }
+        None
+    }
 
-        // 查找此数据库的专属密钥, 否则用默认密钥
-        let (actual_hex, actual_bytes) = if let Some(db_key) = Self::lookup_db_key(db_name) {
-            let bytes = hex_to_bytes(&db_key).unwrap_or_default();
-            (db_key, bytes)
-        } else {
-            (key_hex.to_string(), key_bytes.to_vec())
+    /// 获取 wechat_keys.json 中所有唯一密钥 (用于暴力匹配)
+    fn all_json_keys() -> Vec<String> {
+        let map = match Self::read_keys_json() {
+            Some(m) => m,
+            None => return vec![],
         };
+        let mut seen = std::collections::HashSet::new();
+        map.into_values().filter(|v| seen.insert(v.clone())).collect()
+    }
 
+    /// 用指定密钥尝试打开加密数据库
+    fn try_open_db_with_key(path: &Path, db_name: &str, key_hex: &str, key_bytes: &[u8]) -> Result<Connection> {
         let conn = Connection::open_with_flags(
-            &path,
+            path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ).with_context(|| format!("打开数据库失败: {}", path.display()))?;
 
-        if actual_bytes.len() == 48 {
+        if key_bytes.len() == 48 {
             // 已派生密钥: PRAGMA key = "x'<96hex>'" 跳过 PBKDF2
-            let pragma = format!("PRAGMA key = \"x'{}'\";", actual_hex);
+            let pragma = format!("PRAGMA key = \"x'{}'\";", key_hex);
             conn.execute_batch(&pragma)
                 .with_context(|| format!("PRAGMA key 失败: {}", db_name))?;
         } else {
@@ -376,8 +387,8 @@ impl DbManager {
                 let handle = conn.handle();
                 sqlite3_key(
                     handle as *mut std::ffi::c_void,
-                    actual_bytes.as_ptr(),
-                    actual_bytes.len() as std::ffi::c_int,
+                    key_bytes.as_ptr(),
+                    key_bytes.len() as std::ffi::c_int,
                 )
             };
             anyhow::ensure!(rc == 0, "sqlite3_key() 失败, rc={}", rc);
@@ -396,11 +407,53 @@ impl DbManager {
         Ok(conn)
     }
 
+    /// 打开加密数据库 (只读模式, 自动尝试专属密钥 → 默认密钥 → 暴力匹配)
+    fn open_db(key_hex: &str, key_bytes: &[u8], db_dir: &Path, db_name: &str) -> Result<Connection> {
+        let path = db_dir.join(db_name);
+        anyhow::ensure!(path.exists(), "数据库不存在: {}", path.display());
+
+        // 1. 查找此数据库的专属密钥
+        if let Some(db_key) = Self::lookup_db_key(db_name) {
+            let bytes = hex_to_bytes(&db_key).unwrap_or_default();
+            if let Ok(conn) = Self::try_open_db_with_key(&path, db_name, &db_key, &bytes) {
+                return Ok(conn);
+            }
+            debug!("🔑 {} 专属密钥解密失败, 尝试其他密钥...", db_name);
+        }
+
+        // 2. 尝试默认密钥
+        if let Ok(conn) = Self::try_open_db_with_key(&path, db_name, key_hex, key_bytes) {
+            return Ok(conn);
+        }
+
+        // 3. 暴力匹配: 尝试 wechat_keys.json 中的所有密钥
+        //    (处理首次登录时 message_N.db 在密钥提取后才创建的场景)
+        let all_keys = Self::all_json_keys();
+        for candidate in &all_keys {
+            if candidate == key_hex { continue; } // 已尝试过
+            let bytes = match hex_to_bytes(candidate) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(conn) = Self::try_open_db_with_key(&path, db_name, candidate, &bytes) {
+                info!("🔑 {} 通过暴力匹配找到正确密钥", db_name);
+                return Ok(conn);
+            }
+        }
+
+        anyhow::bail!("数据库解密验证失败: {} (已尝试 {} 个密钥)", db_name, all_keys.len() + 1)
+    }
+
     /// 确保至少有一个 message 数据库连接可用 (如为空则重新扫描)
     fn ensure_msg_conns(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Arc<std::sync::Mutex<Connection>>>>> {
         let mut guard = self.msg_conns.lock().map_err(|e| anyhow::anyhow!("msg_conns lock poisoned: {}", e))?;
         if guard.is_empty() {
-            info!("🔗 重新扫描 message 数据库...");
+            let count = self.rescan_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count == 0 {
+                info!("🔗 重新扫描 message 数据库...");
+            } else {
+                debug!("🔗 重新扫描 message 数据库... (第{}次)", count + 1);
+            }
             let msg_dir = self.db_dir.join("message");
             if msg_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(&msg_dir) {
@@ -417,6 +470,10 @@ impl DbManager {
                         }
                     }
                 }
+            }
+            if !guard.is_empty() {
+                // 成功连接后重置计数器
+                self.rescan_count.store(0, std::sync::atomic::Ordering::Relaxed);
             }
             anyhow::ensure!(!guard.is_empty(), "无可用的 message 数据库");
         }
