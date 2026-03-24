@@ -7,149 +7,24 @@
 //! - input: X11 XTEST 输入注入
 //! - db: 数据库监听 (SQLCipher 解密 + fanotify WAL 监听)
 //! - api: HTTP/WebSocket API
+//! - config: 配置文件管理
+//! - console: 交互式控制台
 
 mod atspi;
 mod api;
 mod chatwnd;
+mod config;
+mod console;
 mod db;
 mod input;
 mod wechat;
 
 use anyhow::Result;
-use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{debug, error, info, warn};
 
-// =====================================================================
-// 配置文件
-// =====================================================================
-
-#[derive(Debug, Deserialize, Default)]
-pub struct AppConfig {
-    #[serde(default)]
-    api: ApiConfig,
-    #[serde(default)]
-    listen: ListenConfig,
-    #[serde(default)]
-    timing: TimingConfig,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct ApiConfig {
-    /// API 认证 Token (留空或不配置则不启用认证)
-    #[serde(default)]
-    token: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct ListenConfig {
-    /// 启动后自动弹出独立窗口并监听的对象
-    #[serde(default)]
-    pub auto: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TimingConfig {
-    /// @ 输入流程中每步的等待时间 (毫秒)
-    #[serde(default = "default_at_delay")]
-    pub at_delay_ms: u64,
-}
-
-impl Default for TimingConfig {
-    fn default() -> Self {
-        Self { at_delay_ms: 300 }
-    }
-}
-
-fn default_at_delay() -> u64 { 300 }
-
-/// 加载配置文件 (搜索多个路径)
-/// 返回 (配置, 配置文件路径)
-fn load_config() -> (AppConfig, Option<PathBuf>) {
-    let search_paths = [
-        PathBuf::from("./config.toml"),
-        PathBuf::from("/home/wechat/mimicwx-linux/config.toml"),
-        PathBuf::from("/etc/mimicwx/config.toml"),
-    ];
-    for path in &search_paths {
-        if path.exists() {
-            match std::fs::read_to_string(path) {
-                Ok(content) => match toml::from_str::<AppConfig>(&content) {
-                    Ok(config) => {
-                        info!("⚙️ 配置文件已加载: {}", path.display());
-                        return (config, Some(path.clone()));
-                    }
-                    Err(e) => {
-                        warn!("⚠️ 配置文件解析失败: {} - {}", path.display(), e);
-                    }
-                },
-                Err(e) => {
-                    warn!("⚠️ 配置文件读取失败: {} - {}", path.display(), e);
-                }
-            }
-        }
-    }
-    info!("⚙️ 未找到配置文件, 使用默认配置");
-    (AppConfig::default(), None)
-}
-
-/// 保存监听列表到 config.toml (仅替换 auto = [...] 行, 保留注释和格式)
-pub fn save_listen_list(config_path: &std::path::Path, listen_list: &[String]) {
-    let content = match std::fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("⚠️ 无法读取配置文件: {e}");
-            return;
-        }
-    };
-
-    // 构造新的 auto 行 (横排格式, 与用户原始风格一致)
-    let new_auto = if listen_list.is_empty() {
-        "auto = []".to_string()
-    } else {
-        let items: Vec<_> = listen_list.iter().map(|s| format!("\"{}\"", s)).collect();
-        format!("auto = [{}]", items.join(","))
-    };
-
-    // 逐行扫描, 找到非注释的 auto = [...] 行并替换
-    // (跳过 # 开头的注释行, 避免误匹配 "# 示例: auto = [...]")
-    let mut new_lines: Vec<String> = Vec::new();
-    let mut found = false;
-    let mut skip_continuation = false; // 跨行数组: 跳过后续行直到 ]
-    for line in content.lines() {
-        if skip_continuation {
-            if line.contains(']') {
-                skip_continuation = false;
-            }
-            continue; // 跳过跨行数组的中间行
-        }
-        let trimmed = line.trim();
-        if !trimmed.starts_with('#') && trimmed.starts_with("auto") && trimmed.contains('=') {
-            // 这是真正的 auto = [...] 行
-            if trimmed.contains('[') && !trimmed.contains(']') {
-                // 跨行数组: auto = [\n  "a",\n  "b",\n]
-                skip_continuation = true;
-            }
-            new_lines.push(new_auto.clone());
-            found = true;
-        } else {
-            new_lines.push(line.to_string());
-        }
-    }
-    let new_content = if found {
-        new_lines.join("\n")
-    } else {
-        // 没有 auto 行, 在 [listen] 段后追加
-        content.replace("[listen]", &format!("[listen]\n{}", new_auto))
-    };
-
-    match std::fs::write(config_path, new_content) {
-        Ok(_) => info!("⚙️ 监听列表已保存到 {}", config_path.display()),
-        Err(e) => warn!("⚠️ 保存配置失败: {e}"),
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -165,7 +40,7 @@ async fn main() -> Result<()> {
     info!("🚀 MimicWX-Linux v{} 启动中...", env!("CARGO_PKG_VERSION"));
 
     // ① 加载配置文件
-    let (config, config_path) = load_config();
+    let (config, config_path) = config::load_config();
     if !config.listen.auto.is_empty() {
         debug!("📋 自动监听列表: {:?}", config.listen.auto);
     }
@@ -232,9 +107,10 @@ async fn main() -> Result<()> {
     }
 
     // ⑥ 读取数据库密钥 (内存扫描提取) + 初始化 DbManager
-    let key_path = "/tmp/wechat_key.txt";
+    // 优先检查持久化路径, 回退到 /tmp (兼容)
+    let key_paths = ["/home/wechat/.cache/wechat_key.txt", "/tmp/wechat_key.txt"];
     for i in 0..10 {
-        if std::path::Path::new(key_path).exists() {
+        if key_paths.iter().any(|p| std::path::Path::new(p).exists()) {
             break;
         }
         if i == 0 {
@@ -242,6 +118,11 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+
+    let key_path = key_paths.iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied()
+        .unwrap_or(key_paths[0]);
 
     let db_manager: Option<Arc<db::DbManager>> = match std::fs::read_to_string(key_path) {
         Ok(key) => {
@@ -256,14 +137,33 @@ async fn main() -> Result<()> {
                         match db::DbManager::new(key, dir) {
                             Ok(mgr) => {
                                 let mgr = Arc::new(mgr);
-                                // 等待微信同步数据库后再加载联系人 (刚登录时表不完整)
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                // 等待微信创建消息数据库后再标记已读
+                                // 首次登录时 message_N.db 可能尚未创建, 需要重试等待
+                                let mark_ok = {
+                                    let mut ok = false;
+                                    for attempt in 0..10 {
+                                        let wait = if attempt == 0 { 5 } else { 3 };
+                                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                                        match mgr.mark_all_read().await {
+                                            Ok(()) => { ok = true; break; }
+                                            Err(e) => {
+                                                if attempt < 9 {
+                                                    debug!("⏳ 消息数据库尚未就绪 (第{}次), {}秒后重试: {}",
+                                                        attempt + 1, 3, e);
+                                                } else {
+                                                    warn!("⚠️ 标记已读失败 (已重试10次): {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ok
+                                };
+                                // 联系人加载 (在消息表就绪后执行, 或独立尝试)
                                 if let Err(e) = mgr.refresh_contacts().await {
                                     warn!("⚠️ 联系人加载失败 (可能尚无数据): {}", e);
                                 }
-                                // 标记已有消息为已读
-                                if let Err(e) = mgr.mark_all_read().await {
-                                    warn!("⚠️ 标记已读失败: {}", e);
+                                if !mark_ok {
+                                    info!("ℹ️ 消息数据库将在收到首条消息时自动连接");
                                 }
                                 Some(mgr)
                             }
@@ -492,7 +392,7 @@ async fn main() -> Result<()> {
         let console_input_tx = input_tx.clone();
         let console_config_path = config_path.clone();
         tokio::spawn(async move {
-            console_loop(console_exit, console_shutdown, console_wechat, console_db_ref, console_tx, console_input_tx, console_config_path).await;
+            console::console_loop(console_exit, console_shutdown, console_wechat, console_db_ref, console_tx, console_input_tx, console_config_path).await;
         });
     }
 
@@ -589,433 +489,4 @@ fn dirs_or_home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"))
 }
-
-// =====================================================================
-// 交互式控制台 (raw terminal mode + 行编辑 + 历史命令)
-// =====================================================================
-
-/// Raw mode guard — Drop 时自动恢复终端
-struct RawModeGuard(libc::termios);
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.0); }
-        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\r\n");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
-}
-
-/// 启用 raw input mode (关闭行缓冲+回显, 保留输出处理和信号)
-fn enable_raw_mode() -> Option<RawModeGuard> {
-    unsafe {
-        let mut orig: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 { return None; }
-        let mut raw = orig;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) != 0 { return None; }
-        Some(RawModeGuard(orig))
-    }
-}
-
-/// 重绘提示行
-fn redraw_prompt(line: &str, cursor: usize) {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "\r\x1b[K> {}", line);
-    let move_back = line[cursor..].chars().count();
-    if move_back > 0 { let _ = write!(out, "\x1b[{}D", move_back); }
-    let _ = out.flush();
-}
-
-async fn handle_command(
-    cmd: &str, exit_code: &Arc<AtomicI32>,
-    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
-    wechat: &Arc<wechat::WeChat>, db: &Option<Arc<db::DbManager>>,
-    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
-    input_tx: &tokio::sync::mpsc::Sender<api::InputCommand>,
-    config_path: &Option<PathBuf>,
-) -> bool {
-    match cmd {
-        "/restart" => {
-            info!("🔄 收到 /restart 命令, 准备重启...");
-            exit_code.store(42, Ordering::Relaxed);
-            let _ = shutdown_tx.send(()); true
-        }
-        "/stop" => {
-            info!("🛑 收到 /stop 命令, 正常关闭...");
-            exit_code.store(0, Ordering::Relaxed);
-            let _ = shutdown_tx.send(()); true
-        }
-        "/status" => {
-            let status = wechat.check_status().await;
-            let listen_list = wechat.get_listen_list().await;
-            let db_status = if db.is_some() { "可用" } else { "不可用" };
-            let contacts = if let Some(ref d) = db { d.get_contacts().await.len() } else { 0 };
-            info!("📊 === 运行时状态 ===");
-            info!("📊 微信状态: {}", status);
-            info!("📊 数据库: {} | 联系人: {} 条", db_status, contacts);
-            info!("📊 监听窗口: {} 个 {:?}", listen_list.len(), listen_list);
-            info!("📊 版本: v{}", env!("CARGO_PKG_VERSION"));
-            info!("📊 =================="); false
-        }
-        "/refresh" => {
-            if let Some(ref d) = db {
-                info!("👥 手动刷新联系人...");
-                match d.refresh_contacts().await {
-                    Ok(n) => info!("👥 刷新完成: {} 条", n),
-                    Err(e) => warn!("⚠️ 刷新失败: {}", e),
-                }
-            } else { info!("⚠️ 数据库不可用"); }
-            false
-        }
-        "/atmode" => {
-            let msg = serde_json::json!({
-                "type": "control",
-                "cmd": "toggle_at_mode",
-            });
-            let _ = broadcast_tx.send(msg.to_string());
-            info!("📢 已发送仅@模式切换指令");
-            false
-        }
-        "/reload" => {
-            if let Some(ref path) = config_path {
-                match std::fs::read_to_string(path) {
-                    Ok(content) => match toml::from_str::<AppConfig>(&content) {
-                        Ok(new_config) => {
-                            // 1. 更新 at_delay_ms
-                            let old_delay = wechat.get_at_delay_ms();
-                            let new_delay = new_config.timing.at_delay_ms;
-                            if old_delay != new_delay {
-                                wechat.set_at_delay_ms(new_delay);
-                                info!("⚙️ at_delay_ms: {old_delay} → {new_delay}");
-                            }
-                            // 2. Diff listen 列表
-                            let current_list = wechat.get_listen_list().await;
-                            let new_list = new_config.listen.auto;
-                            // 新增的
-                            let to_add: Vec<_> = new_list.iter()
-                                .filter(|n| !current_list.contains(n))
-                                .cloned().collect();
-                            // 移除的
-                            let to_remove: Vec<_> = current_list.iter()
-                                .filter(|n| !new_list.contains(n))
-                                .cloned().collect();
-                            if to_add.is_empty() && to_remove.is_empty() {
-                                info!("⚙️ 监听列表无变化");
-                            } else {
-                                for who in &to_remove {
-                                    info!("👂 /reload 移除监听: {who}");
-                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                    if input_tx.send(api::InputCommand::RemoveListen {
-                                        who: who.clone(), reply: reply_tx,
-                                    }).await.is_ok() {
-                                        let _ = reply_rx.await;
-                                    }
-                                }
-                                for who in &to_add {
-                                    info!("👂 /reload 添加监听: {who}");
-                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                    if input_tx.send(api::InputCommand::AddListen {
-                                        who: who.clone(), reply: reply_tx,
-                                    }).await.is_ok() {
-                                        match reply_rx.await {
-                                            Ok(Ok(true)) => info!("✅ 监听已添加: {who}"),
-                                            _ => warn!("⚠️ 添加监听失败: {who}"),
-                                        }
-                                    }
-                                    // 每个目标间隔 3 秒
-                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                }
-                            }
-                            info!("⚙️ 配置已重新加载");
-                        }
-                        Err(e) => warn!("⚠️ 配置解析失败: {e}"),
-                    },
-                    Err(e) => warn!("⚠️ 读取配置失败: {e}"),
-                }
-            } else {
-                info!("⚠️ 未找到配置文件路径, 无法重载");
-            }
-            false
-        }
-        "/sessions" => {
-            if let Some(ref d) = db {
-                match d.get_sessions().await {
-                    Ok(sessions) => {
-                        info!("💬 === 会话列表 ({} 个) ===", sessions.len());
-                        for s in &sessions {
-                            let unread = if s.unread_count > 0 {
-                                format!(" [未读:{}]", s.unread_count)
-                            } else { String::new() };
-                            info!("💬  {} ({}){}", s.display_name, s.username, unread);
-                        }
-                        info!("💬 ==================");
-                    }
-                    Err(e) => warn!("⚠️ 获取会话失败: {}", e),
-                }
-            } else { info!("⚠️ 数据库不可用"); }
-            false
-        }
-        _ if cmd.starts_with("/send ") => {
-            let rest = cmd.strip_prefix("/send ").unwrap().trim();
-            if let Some((to, text)) = rest.split_once(' ') {
-                let to = to.trim();
-                let text = text.trim();
-                if to.is_empty() || text.is_empty() {
-                    info!("❌ 用法: /send <收件人> <内容>");
-                } else {
-                    info!("📤 发送消息: [{to}] → {text}");
-                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    let has_db = db.is_some();
-                    if input_tx.send(api::InputCommand::SendMessage {
-                        to: to.to_string(), text: text.to_string(),
-                        at: vec![], skip_verify: has_db,
-                        reply: reply_tx,
-                    }).await.is_ok() {
-                        match reply_rx.await {
-                            Ok(Ok((true, _, msg))) => info!("✅ {msg}"),
-                            Ok(Ok((false, _, msg))) => warn!("⚠️ {msg}"),
-                            Ok(Err(e)) => warn!("⚠️ 发送失败: {e}"),
-                            Err(_) => warn!("⚠️ actor 响应通道已关闭"),
-                        }
-                    } else { warn!("⚠️ InputEngine actor 已停止"); }
-                }
-            } else {
-                info!("❌ 用法: /send <收件人> <内容>");
-            }
-            false
-        }
-        _ if cmd.starts_with("/listen ") => {
-            let who = cmd.strip_prefix("/listen ").unwrap().trim();
-            if who.is_empty() {
-                info!("❌ 用法: /listen <联系人/群名>");
-            } else {
-                info!("👂 添加监听: {who}");
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                if input_tx.send(api::InputCommand::AddListen {
-                    who: who.to_string(), reply: reply_tx,
-                }).await.is_ok() {
-                    match reply_rx.await {
-                        Ok(Ok(true)) => {
-                            info!("✅ 监听已添加: {who}");
-                            // 持久化: 写入 config.toml
-                            if let Some(ref path) = config_path {
-                                let mut list = wechat.get_listen_list().await;
-                                if !list.contains(&who.to_string()) {
-                                    list.push(who.to_string());
-                                }
-                                save_listen_list(path, &list);
-                            }
-                        }
-                        Ok(Ok(false)) => warn!("⚠️ 添加监听失败: {who}"),
-                        Ok(Err(e)) => warn!("⚠️ 添加监听错误: {e}"),
-                        Err(_) => warn!("⚠️ actor 响应通道已关闭"),
-                    }
-                } else { warn!("⚠️ InputEngine actor 已停止"); }
-            }
-            false
-        }
-        _ if cmd.starts_with("/unlisten ") => {
-            let who = cmd.strip_prefix("/unlisten ").unwrap().trim();
-            if who.is_empty() {
-                info!("❌ 用法: /unlisten <联系人/群名>");
-            } else {
-                info!("👂 移除监听: {who}");
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                if input_tx.send(api::InputCommand::RemoveListen {
-                    who: who.to_string(), reply: reply_tx,
-                }).await.is_ok() {
-                    match reply_rx.await {
-                        Ok(true) => {
-                            info!("✅ 监听已移除: {who}");
-                            // 持久化: 写入 config.toml
-                            if let Some(ref path) = config_path {
-                                let mut list = wechat.get_listen_list().await;
-                                list.retain(|n| n != who);
-                                save_listen_list(path, &list);
-                            }
-                        }
-                        Ok(false) => info!("⚠️ 未找到监听: {who}"),
-                        Err(_) => warn!("⚠️ actor 响应通道已关闭"),
-                    }
-                } else { warn!("⚠️ InputEngine actor 已停止"); }
-            }
-            false
-        }
-        "/help" => {
-            info!("💡 === 可用命令 ===");
-            info!("💡 /restart  — 优雅重启    /stop — 关闭程序");
-            info!("💡 /status   — 运行状态    /refresh — 刷新联系人");
-            info!("💡 /atmode   — 切换仅@模式  /sessions — 查看会话列表");
-            info!("💡 /reload   — 热重载配置    /help — 显示帮助");
-            info!("💡 /send <收件人> <内容> — 发送消息");
-            info!("💡 /listen <名称>       — 添加监听");
-            info!("💡 /unlisten <名称>     — 移除监听");
-            info!("💡 快捷键: ↑↓历史 ←→光标 Ctrl+U清行 Ctrl+L清屏");
-            info!("💡 =================="); false
-        }
-        _ => { info!("❓ 未知命令: {} (/help 查看帮助)", cmd); false }
-    }
-}
-
-/// 交互式控制台主循环 (raw mode)
-async fn console_loop(
-    exit_code: Arc<AtomicI32>,
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
-    wechat: Arc<wechat::WeChat>,
-    db: Option<Arc<db::DbManager>>,
-    broadcast_tx: tokio::sync::broadcast::Sender<String>,
-    input_tx: tokio::sync::mpsc::Sender<api::InputCommand>,
-    config_path: Option<PathBuf>,
-) {
-    let _guard = match enable_raw_mode() {
-        Some(g) => g,
-        None => {
-            debug!("📥 非 TTY, 降级为简单模式");
-            console_loop_simple(exit_code, shutdown_tx, wechat, db, broadcast_tx, input_tx, config_path).await;
-            return;
-        }
-    };
-
-    use tokio::io::AsyncReadExt;
-    let mut stdin = tokio::io::stdin();
-    let mut line = String::new();
-    let mut cursor: usize = 0;
-    let mut history: Vec<String> = Vec::new();
-    let mut hist_idx: usize = 0;
-
-    redraw_prompt(&line, cursor);
-
-    let mut buf = [0u8; 128];
-    loop {
-        let n = match stdin.read(&mut buf).await {
-            Ok(0) => break, Ok(n) => n, Err(_) => break,
-        };
-
-        let bytes = &buf[..n];
-        let mut i = 0;
-        let mut redraw = false;
-        let mut exec = false;
-
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\r' | b'\n' => { exec = true; i += 1; break; }
-                0x7f | 0x08 => { // Backspace
-                    if cursor > 0 {
-                        let prev = line[..cursor].char_indices().last().map(|(p,_)|p).unwrap_or(0);
-                        line.drain(prev..cursor); cursor = prev; redraw = true;
-                    }
-                    i += 1;
-                }
-                0x1b if i+2 < bytes.len() && bytes[i+1] == b'[' => match bytes[i+2] {
-                    b'A' => { // ↑ 历史
-                        if !history.is_empty() && hist_idx > 0 {
-                            hist_idx -= 1; line = history[hist_idx].clone();
-                            cursor = line.len(); redraw = true;
-                        }
-                        i += 3;
-                    }
-                    b'B' => { // ↓ 历史
-                        if hist_idx < history.len() {
-                            hist_idx += 1;
-                            line = if hist_idx < history.len() { history[hist_idx].clone() } else { String::new() };
-                            cursor = line.len(); redraw = true;
-                        }
-                        i += 3;
-                    }
-                    b'C' => { // →
-                        if cursor < line.len() {
-                            cursor = line[cursor..].char_indices().nth(1).map(|(ci,_)|cursor+ci).unwrap_or(line.len());
-                            redraw = true;
-                        }
-                        i += 3;
-                    }
-                    b'D' => { // ←
-                        if cursor > 0 {
-                            cursor = line[..cursor].char_indices().last().map(|(p,_)|p).unwrap_or(0);
-                            redraw = true;
-                        }
-                        i += 3;
-                    }
-                    b'H' => { cursor = 0; redraw = true; i += 3; }
-                    b'F' => { cursor = line.len(); redraw = true; i += 3; }
-                    b'3' if i+3 < bytes.len() && bytes[i+3] == b'~' => { // Delete
-                        if cursor < line.len() {
-                            let next = line[cursor..].char_indices().nth(1).map(|(ci,_)|cursor+ci).unwrap_or(line.len());
-                            line.drain(cursor..next); redraw = true;
-                        }
-                        i += 4;
-                    }
-                    _ => { i += 3; }
-                }
-                0x01 => { cursor = 0; redraw = true; i += 1; }                   // Ctrl+A
-                0x05 => { cursor = line.len(); redraw = true; i += 1; }           // Ctrl+E
-                0x15 => { line.clear(); cursor = 0; redraw = true; i += 1; }      // Ctrl+U
-                0x0c => { // Ctrl+L
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[2J\x1b[H");
-                    redraw = true; i += 1;
-                }
-                b if b >= 0x20 && b < 0x7f => { // ASCII
-                    line.insert(cursor, b as char); cursor += 1; redraw = true; i += 1;
-                }
-                b if b >= 0x80 => { // UTF-8
-                    let clen = if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
-                    if i + clen <= bytes.len() {
-                        if let Ok(s) = std::str::from_utf8(&bytes[i..i+clen]) {
-                            line.insert_str(cursor, s); cursor += s.len(); redraw = true;
-                        }
-                    }
-                    i += clen;
-                }
-                _ => { i += 1; }
-            }
-        }
-
-        if redraw && !exec { redraw_prompt(&line, cursor); }
-
-        if exec {
-            let cmd = line.trim().to_string();
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\r\n");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-            if !cmd.is_empty() {
-                if history.last().map(|h| h != &cmd).unwrap_or(true) { history.push(cmd.clone()); }
-                if handle_command(&cmd, &exit_code, &shutdown_tx, &wechat, &db, &broadcast_tx, &input_tx, &config_path).await { return; }
-            }
-            line.clear(); cursor = 0; hist_idx = history.len();
-            redraw_prompt(&line, cursor);
-        }
-    }
-}
-
-/// 简单控制台 (非 TTY 降级模式)
-async fn console_loop_simple(
-    exit_code: Arc<AtomicI32>,
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
-    wechat: Arc<wechat::WeChat>,
-    db: Option<Arc<db::DbManager>>,
-    broadcast_tx: tokio::sync::broadcast::Sender<String>,
-    input_tx: tokio::sync::mpsc::Sender<api::InputCommand>,
-    config_path: Option<PathBuf>,
-) {
-    use tokio::io::AsyncBufReadExt;
-    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let cmd = line.trim().to_string();
-                if !cmd.is_empty() {
-                    if handle_command(&cmd, &exit_code, &shutdown_tx, &wechat, &db, &broadcast_tx, &input_tx, &config_path).await { break; }
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-
 

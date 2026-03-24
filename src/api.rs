@@ -701,7 +701,7 @@ async fn exec_reload(state: &AppState) -> String {
         Ok(c) => c,
         Err(e) => return format!("⚠️ 读取配置失败: {e}"),
     };
-    let new_config: crate::AppConfig = match toml::from_str(&content) {
+    let new_config: crate::config::AppConfig = match toml::from_str(&content) {
         Ok(c) => c,
         Err(e) => return format!("⚠️ 配置解析失败: {e}"),
     };
@@ -766,7 +766,7 @@ async fn exec_listen(state: &AppState, who: &str) -> String {
             if let Some(ref path) = state.config_path {
                 let mut list = state.wechat.get_listen_list().await;
                 if !list.contains(&who.to_string()) { list.push(who.to_string()); }
-                crate::save_listen_list(path, &list);
+                crate::config::save_listen_list(path, &list);
             }
             format!("✅ 监听已添加: {who}")
         }
@@ -790,7 +790,7 @@ async fn exec_unlisten(state: &AppState, who: &str) -> String {
             if let Some(ref path) = state.config_path {
                 let mut list = state.wechat.get_listen_list().await;
                 list.retain(|n| n != who);
-                crate::save_listen_list(path, &list);
+                crate::config::save_listen_list(path, &list);
             }
             format!("✅ 监听已移除: {who}")
         }
