@@ -13,7 +13,7 @@ import re, os, sys, time, json, struct, hashlib
 import hmac as hmac_mod
 
 # 持久化路径 (避免 docker restart 丢失)
-KEY_DIR = "/home/wechat/.cache"
+KEY_DIR = "/home/wechat/.xwechat"
 KEY_FILE = os.path.join(KEY_DIR, "wechat_key.txt")
 KEY_JSON_FILE = os.path.join(KEY_DIR, "wechat_keys.json")
 # 兼容旧路径 (MimicWX 可能从 /tmp 读取)
@@ -147,7 +147,7 @@ def match_keys_to_dbs(keys, db_dir):
             # HMAC 验证
             if verify_key_for_db(db_path, k['enc_key']):
                 matched[rel] = k
-                print(f"[extract_key]   ✅ {rel} → salt 匹配 + HMAC 验证通过")
+                print(f"[extract_key]   [ok] {rel} → salt 匹配 + HMAC 验证通过")
             else:
                 # salt 匹配但 HMAC 失败，尝试其他密钥
                 unmatched_dbs.append(rel)
@@ -160,7 +160,7 @@ def match_keys_to_dbs(keys, db_dir):
         for k in keys:
             if verify_key_for_db(db_path, k['enc_key']):
                 matched[rel] = k
-                print(f"[extract_key]   ✅ {rel} → HMAC 暴力匹配成功")
+                print(f"[extract_key]   [ok] {rel} → HMAC 暴力匹配成功")
                 break
     
     return matched
@@ -183,7 +183,7 @@ def save_keys(matched, all_keys):
                 f.write(first_key['raw_key'])
 
 def main():
-    print("[extract_key] 🔑 微信密钥提取脚本启动 (内存扫描 + HMAC 验证)")
+    print("[extract_key] [key] 微信密钥提取脚本启动 (内存扫描 + HMAC 验证)")
 
     pid = None
     for _ in range(60):
@@ -192,26 +192,26 @@ def main():
             break
         time.sleep(1)
     if not pid:
-        print("[extract_key] ❌ 未找到微信进程")
+        print("[extract_key] [err] 未找到微信进程")
         sys.exit(1)
 
-    print(f"[extract_key] 📍 微信 PID: {pid}")
-    print("[extract_key] ⏳ 等待用户扫码登录...")
-    print("[extract_key] 📱 请通过 noVNC (http://localhost:6080/vnc.html) 扫码登录微信")
+    print(f"[extract_key] 微信 PID: {pid}")
+    print("[extract_key] [wait] 等待用户扫码登录...")
+    print("[extract_key] [login] 请通过 noVNC (http://localhost:6080/vnc.html) 扫码登录微信")
 
     start_time = time.time()
     while time.time() - start_time < MAX_WAIT:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            print("[extract_key] ❌ 微信进程已退出")
+            print("[extract_key] [err] 微信进程已退出")
             sys.exit(1)
 
         keys = scan_process_memory(pid)
         if not keys:
             elapsed = int(time.time() - start_time)
             if elapsed % 30 == 0 and elapsed > 0:
-                print(f"[extract_key] ⏳ 已等待 {elapsed}s...")
+                print(f"[extract_key] [wait] 已等待 {elapsed}s...")
             time.sleep(SCAN_INTERVAL)
             continue
 
@@ -222,11 +222,11 @@ def main():
                 unique[k['raw_key']] = k
         keys = list(unique.values())
         
-        print(f"[extract_key] 🔍 找到 {len(keys)} 个唯一密钥, 开始匹配数据库...")
+        print(f"[extract_key] 找到 {len(keys)} 个唯一密钥, 开始匹配数据库...")
 
         db_dir = find_db_dir()
         if not db_dir:
-            print("[extract_key] ⚠️ 数据库目录未就绪, 稍后重试...")
+            print("[extract_key] [warn] 数据库目录未就绪, 稍后重试...")
             time.sleep(5)
             continue
 
@@ -234,8 +234,8 @@ def main():
         
         if matched:
             save_keys(matched, keys)
-            print(f"[extract_key] ✅ 成功匹配 {len(matched)} 个数据库的密钥!")
-            print(f"[extract_key] 📝 密钥已保存到 {KEY_FILE} 和 {KEY_JSON_FILE}")
+            print(f"[extract_key] [ok] 成功匹配 {len(matched)} 个数据库的密钥!")
+            print(f"[extract_key] 密钥已保存到 {KEY_FILE} 和 {KEY_JSON_FILE}")
             # 延迟重扫: 微信可能在登录后才创建部分 DB (如 message_0.db)
             rescan_for_new_dbs(pid, db_dir, matched)
             return
@@ -243,25 +243,25 @@ def main():
             # 密钥找到但没匹配到数据库 (可能数据库还没创建完)
             elapsed = int(time.time() - start_time)
             if elapsed < 30:
-                print(f"[extract_key] ⚠️ 密钥未匹配到数据库, 等待数据库就绪...")
+                print(f"[extract_key] [warn] 密钥未匹配到数据库, 等待数据库就绪...")
                 time.sleep(5)
                 continue
             else:
                 # 超过 30 秒还没匹配到, 直接保存
-                print(f"[extract_key] ⚠️ 未匹配到数据库, 保存原始密钥")
+                print(f"[extract_key] [warn] 未匹配到数据库, 保存原始密钥")
                 save_keys({}, keys)
                 for kpath in [KEY_FILE, KEY_FILE_COMPAT]:
                     with open(kpath, 'w') as f:
                         f.write(keys[0]['raw_key'])
                 return
 
-    print(f"[extract_key] ❌ 超时 ({MAX_WAIT}s), 未找到密钥")
+    print(f"[extract_key] [err] 超时 ({MAX_WAIT}s), 未找到密钥")
     sys.exit(1)
 
 def rescan_for_new_dbs(pid, db_dir, initial_matched):
     """延迟重扫: 监控 db_storage 30s, 有新 .db 就重新提取并匹配"""
     initial_dbs = set(initial_matched.keys())
-    print(f"[extract_key] 🔄 开始监控新数据库 (30s)...")
+    print(f"[extract_key] [scan] 开始监控新数据库 (30s)...")
     
     for i in range(6):  # 6 x 5s = 30s
         time.sleep(5)
@@ -270,7 +270,7 @@ def rescan_for_new_dbs(pid, db_dir, initial_matched):
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            print("[extract_key] ⚠️ 微信进程已退出, 停止监控")
+            print("[extract_key] [warn] 微信进程已退出, 停止监控")
             return
         
         # 扫描当前所有 DB
@@ -285,7 +285,7 @@ def rescan_for_new_dbs(pid, db_dir, initial_matched):
         if not new_dbs:
             continue
         
-        print(f"[extract_key] 🆕 发现 {len(new_dbs)} 个新数据库: {', '.join(sorted(new_dbs))}")
+        print(f"[extract_key] [new] 发现 {len(new_dbs)} 个新数据库: {', '.join(sorted(new_dbs))}")
         
         # 重新扫描内存 (新 DB 的密钥可能刚加载)
         keys = scan_process_memory(pid)
@@ -303,11 +303,11 @@ def rescan_for_new_dbs(pid, db_dir, initial_matched):
         if len(matched) > len(initial_matched):
             save_keys(matched, keys)
             new_count = len(matched) - len(initial_matched)
-            print(f"[extract_key] ✅ 更新: 新增 {new_count} 个密钥, 共 {len(matched)} 个")
+            print(f"[extract_key] [ok] 更新: 新增 {new_count} 个密钥, 共 {len(matched)} 个")
             initial_matched.update(matched)
             initial_dbs = set(initial_matched.keys())
     
-    print(f"[extract_key] 🔄 监控结束, 最终匹配 {len(initial_matched)} 个数据库")
+    print(f"[extract_key] [scan] 监控结束, 最终匹配 {len(initial_matched)} 个数据库")
 
 
 if __name__ == "__main__":

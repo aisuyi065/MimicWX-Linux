@@ -70,7 +70,7 @@ async fn handle_command(
 ) -> bool {
     match cmd {
         "/restart" => {
-            info!("🔄 收到 /restart 命令, 准备重启...");
+            info!("[retry] 收到 /restart 命令, 准备重启...");
             exit_code.store(42, Ordering::Relaxed);
             let _ = shutdown_tx.send(()); true
         }
@@ -93,12 +93,12 @@ async fn handle_command(
         }
         "/refresh" => {
             if let Some(ref d) = db {
-                info!("👥 手动刷新联系人...");
+                info!("[contacts] 手动刷新联系人...");
                 match d.refresh_contacts().await {
-                    Ok(n) => info!("👥 刷新完成: {} 条", n),
-                    Err(e) => warn!("⚠️ 刷新失败: {}", e),
+                    Ok(n) => info!("[contacts] 刷新完成: {} 条", n),
+                    Err(e) => warn!("[warn] 刷新失败: {}", e),
                 }
-            } else { info!("⚠️ 数据库不可用"); }
+            } else { info!("[warn] 数据库不可用"); }
             false
         }
         "/atmode" => {
@@ -120,7 +120,7 @@ async fn handle_command(
                             let new_delay = new_config.timing.at_delay_ms;
                             if old_delay != new_delay {
                                 wechat.set_at_delay_ms(new_delay);
-                                info!("⚙️ at_delay_ms: {old_delay} → {new_delay}");
+                                info!("[config] at_delay_ms: {old_delay} → {new_delay}");
                             }
                             // 2. Diff listen 列表
                             let current_list = wechat.get_listen_list().await;
@@ -134,10 +134,10 @@ async fn handle_command(
                                 .filter(|n| !new_list.contains(n))
                                 .cloned().collect();
                             if to_add.is_empty() && to_remove.is_empty() {
-                                info!("⚙️ 监听列表无变化");
+                                info!("[config] 监听列表无变化");
                             } else {
                                 for who in &to_remove {
-                                    info!("👂 /reload 移除监听: {who}");
+                                    info!("[listen] /reload 移除监听: {who}");
                                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                                     if input_tx.send(api::InputCommand::RemoveListen {
                                         who: who.clone(), reply: reply_tx,
@@ -146,28 +146,28 @@ async fn handle_command(
                                     }
                                 }
                                 for who in &to_add {
-                                    info!("👂 /reload 添加监听: {who}");
+                                    info!("[listen] /reload 添加监听: {who}");
                                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                                     if input_tx.send(api::InputCommand::AddListen {
                                         who: who.clone(), reply: reply_tx,
                                     }).await.is_ok() {
                                         match reply_rx.await {
-                                            Ok(Ok(true)) => info!("✅ 监听已添加: {who}"),
-                                            _ => warn!("⚠️ 添加监听失败: {who}"),
+                                            Ok(Ok(true)) => info!("[ok] 监听已添加: {who}"),
+                                            _ => warn!("[warn] 添加监听失败: {who}"),
                                         }
                                     }
                                     // 每个目标间隔 3 秒
                                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                 }
                             }
-                            info!("⚙️ 配置已重新加载");
+                            info!("[config] 配置已重新加载");
                         }
-                        Err(e) => warn!("⚠️ 配置解析失败: {e}"),
+                        Err(e) => warn!("[warn] 配置解析失败: {e}"),
                     },
-                    Err(e) => warn!("⚠️ 读取配置失败: {e}"),
+                    Err(e) => warn!("[warn] 读取配置失败: {e}"),
                 }
             } else {
-                info!("⚠️ 未找到配置文件路径, 无法重载");
+                info!("[warn] 未找到配置文件路径, 无法重载");
             }
             false
         }
@@ -175,18 +175,18 @@ async fn handle_command(
             if let Some(ref d) = db {
                 match d.get_sessions().await {
                     Ok(sessions) => {
-                        info!("💬 === 会话列表 ({} 个) ===", sessions.len());
+                        info!("[session] === 会话列表 ({} 个) ===", sessions.len());
                         for s in &sessions {
                             let unread = if s.unread_count > 0 {
                                 format!(" [未读:{}]", s.unread_count)
                             } else { String::new() };
-                            info!("💬  {} ({}){}", s.display_name, s.username, unread);
+                            info!("[session]  {} ({}){}", s.display_name, s.username, unread);
                         }
-                        info!("💬 ==================");
+                        info!("[session] ==================");
                     }
-                    Err(e) => warn!("⚠️ 获取会话失败: {}", e),
+                    Err(e) => warn!("[warn] 获取会话失败: {}", e),
                 }
-            } else { info!("⚠️ 数据库不可用"); }
+            } else { info!("[warn] 数据库不可用"); }
             false
         }
         _ if cmd.starts_with("/send ") => {
@@ -195,9 +195,9 @@ async fn handle_command(
                 let to = to.trim();
                 let text = text.trim();
                 if to.is_empty() || text.is_empty() {
-                    info!("❌ 用法: /send <收件人> <内容>");
+                    info!("[err] 用法: /send <收件人> <内容>");
                 } else {
-                    info!("📤 发送消息: [{to}] → {text}");
+                    info!("[send] 发送消息: [{to}] → {text}");
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                     let has_db = db.is_some();
                     if input_tx.send(api::InputCommand::SendMessage {
@@ -206,31 +206,31 @@ async fn handle_command(
                         reply: reply_tx,
                     }).await.is_ok() {
                         match reply_rx.await {
-                            Ok(Ok((true, _, msg))) => info!("✅ {msg}"),
-                            Ok(Ok((false, _, msg))) => warn!("⚠️ {msg}"),
-                            Ok(Err(e)) => warn!("⚠️ 发送失败: {e}"),
-                            Err(_) => warn!("⚠️ actor 响应通道已关闭"),
+                            Ok(Ok((true, _, msg))) => info!("[ok] {msg}"),
+                            Ok(Ok((false, _, msg))) => warn!("[warn] {msg}"),
+                            Ok(Err(e)) => warn!("[warn] 发送失败: {e}"),
+                            Err(_) => warn!("[warn] actor 响应通道已关闭"),
                         }
-                    } else { warn!("⚠️ InputEngine actor 已停止"); }
+                    } else { warn!("[warn] InputEngine actor 已停止"); }
                 }
             } else {
-                info!("❌ 用法: /send <收件人> <内容>");
+                info!("[err] 用法: /send <收件人> <内容>");
             }
             false
         }
         _ if cmd.starts_with("/listen ") => {
             let who = cmd.strip_prefix("/listen ").unwrap().trim();
             if who.is_empty() {
-                info!("❌ 用法: /listen <联系人/群名>");
+                info!("[err] 用法: /listen <联系人/群名>");
             } else {
-                info!("👂 添加监听: {who}");
+                info!("[listen] 添加监听: {who}");
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 if input_tx.send(api::InputCommand::AddListen {
                     who: who.to_string(), reply: reply_tx,
                 }).await.is_ok() {
                     match reply_rx.await {
                         Ok(Ok(true)) => {
-                            info!("✅ 监听已添加: {who}");
+                            info!("[ok] 监听已添加: {who}");
                             // 持久化: 写入 config.toml
                             if let Some(ref path) = config_path {
                                 let mut list = wechat.get_listen_list().await;
@@ -240,27 +240,27 @@ async fn handle_command(
                                 config::save_listen_list(path, &list);
                             }
                         }
-                        Ok(Ok(false)) => warn!("⚠️ 添加监听失败: {who}"),
-                        Ok(Err(e)) => warn!("⚠️ 添加监听错误: {e}"),
-                        Err(_) => warn!("⚠️ actor 响应通道已关闭"),
+                        Ok(Ok(false)) => warn!("[warn] 添加监听失败: {who}"),
+                        Ok(Err(e)) => warn!("[warn] 添加监听错误: {e}"),
+                        Err(_) => warn!("[warn] actor 响应通道已关闭"),
                     }
-                } else { warn!("⚠️ InputEngine actor 已停止"); }
+                } else { warn!("[warn] InputEngine actor 已停止"); }
             }
             false
         }
         _ if cmd.starts_with("/unlisten ") => {
             let who = cmd.strip_prefix("/unlisten ").unwrap().trim();
             if who.is_empty() {
-                info!("❌ 用法: /unlisten <联系人/群名>");
+                info!("[err] 用法: /unlisten <联系人/群名>");
             } else {
-                info!("👂 移除监听: {who}");
+                info!("[listen] 移除监听: {who}");
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 if input_tx.send(api::InputCommand::RemoveListen {
                     who: who.to_string(), reply: reply_tx,
                 }).await.is_ok() {
                     match reply_rx.await {
                         Ok(true) => {
-                            info!("✅ 监听已移除: {who}");
+                            info!("[ok] 监听已移除: {who}");
                             // 持久化: 写入 config.toml
                             if let Some(ref path) = config_path {
                                 let mut list = wechat.get_listen_list().await;
@@ -268,24 +268,24 @@ async fn handle_command(
                                 config::save_listen_list(path, &list);
                             }
                         }
-                        Ok(false) => info!("⚠️ 未找到监听: {who}"),
-                        Err(_) => warn!("⚠️ actor 响应通道已关闭"),
+                        Ok(false) => info!("[warn] 未找到监听: {who}"),
+                        Err(_) => warn!("[warn] actor 响应通道已关闭"),
                     }
-                } else { warn!("⚠️ InputEngine actor 已停止"); }
+                } else { warn!("[warn] InputEngine actor 已停止"); }
             }
             false
         }
         "/help" => {
-            info!("💡 === 可用命令 ===");
-            info!("💡 /restart  — 优雅重启    /stop — 关闭程序");
-            info!("💡 /status   — 运行状态    /refresh — 刷新联系人");
-            info!("💡 /atmode   — 切换仅@模式  /sessions — 查看会话列表");
-            info!("💡 /reload   — 热重载配置    /help — 显示帮助");
-            info!("💡 /send <收件人> <内容> — 发送消息");
-            info!("💡 /listen <名称>       — 添加监听");
-            info!("💡 /unlisten <名称>     — 移除监听");
-            info!("💡 快捷键: ↑↓历史 ←→光标 Ctrl+U清行 Ctrl+L清屏");
-            info!("💡 =================="); false
+            info!("[help] === 可用命令 ===");
+            info!("[help] /restart  — 优雅重启    /stop — 关闭程序");
+            info!("[help] /status   — 运行状态    /refresh — 刷新联系人");
+            info!("[help] /atmode   — 切换仅@模式  /sessions — 查看会话列表");
+            info!("[help] /reload   — 热重载配置    /help — 显示帮助");
+            info!("[help] /send <收件人> <内容> — 发送消息");
+            info!("[help] /listen <名称>       — 添加监听");
+            info!("[help] /unlisten <名称>     — 移除监听");
+            info!("[help] 快捷键: ↑↓历史 ←→光标 Ctrl+U清行 Ctrl+L清屏");
+            info!("[help] =================="); false
         }
         _ => { info!("❓ 未知命令: {} (/help 查看帮助)", cmd); false }
     }

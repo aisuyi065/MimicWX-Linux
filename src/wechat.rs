@@ -348,12 +348,12 @@ impl WeChat {
         for title in ["微信", "WeChat", "Weixin"] {
             match engine.activate_window_by_title(title, true) {
                 Ok(true) => {
-                    debug!("🖱️ 激活主窗口: {title}");
+                    debug!("[mouse] 激活主窗口: {title}");
                     tokio::time::sleep(ms(300)).await;
                     return;
                 }
                 Ok(false) => {}
-                Err(e) => debug!("🖱️ X11 激活失败: {e}"),
+                Err(e) => debug!("[mouse] X11 激活失败: {e}"),
             }
         }
 
@@ -368,7 +368,7 @@ impl WeChat {
                         if let Some(bbox) = self.atspi.bbox(&child).await {
                             let cx = (bbox.x + bbox.w / 2).max(0);
                             let cy = (bbox.y + 15).max(0);
-                            debug!("🖱️ AT-SPI 点击主窗口聚焦: ({cx}, {cy})");
+                            debug!("[mouse] AT-SPI 点击主窗口聚焦: ({cx}, {cy})");
                             let _ = engine.click(cx, cy).await;
                             tokio::time::sleep(ms(300)).await;
                             return;
@@ -377,7 +377,7 @@ impl WeChat {
                 }
             }
         }
-        warn!("⚠️ 无法聚焦主窗口");
+        warn!("[warn] 无法聚焦主窗口");
     }
 
     /// 切换到指定聊天 (借鉴 wxauto ChatWith)
@@ -393,13 +393,13 @@ impl WeChat {
             let current = self.current_chat.lock().await;
             if let Some(ref name) = *current {
                 if name == who {
-                    debug!("💬 已在聊天 [{who}], 跳过切换");
+                    debug!("[session] 已在聊天 [{who}], 跳过切换");
                     return Ok(Some(who.to_string()));
                 }
             }
         }
 
-        info!("💬 ChatWith: {who}");
+        info!("[session] ChatWith: {who}");
 
         // 先聚焦主窗口 (独立窗口可能遮挡)
         self.focus_main_window(engine).await;
@@ -412,7 +412,7 @@ impl WeChat {
             if let Some(item) = self.find_session(&list, who).await {
                 if let Some(bbox) = self.atspi.bbox(&item).await {
                     let (cx, cy) = bbox.center();
-                    debug!("💬 会话列表找到 [{who}], 点击 ({cx}, {cy})");
+                    debug!("[session] 会话列表找到 [{who}], 点击 ({cx}, {cy})");
                     engine.click(cx, cy).await?;
                     // 轮询等待消息列表出现 (替代固定 500ms)
                     let loaded = wait_for(&self.atspi, &app, 1500, 50,
@@ -428,7 +428,7 @@ impl WeChat {
                             }
                         }
                     ).await;
-                    debug!("💬 ChatWith 点击后消息列表: {}", if loaded { "已就绪" } else { "超时" });
+                    debug!("[session] ChatWith 点击后消息列表: {}", if loaded { "已就绪" } else { "超时" });
                     *self.current_chat.lock().await = Some(who.to_string());
                     return Ok(Some(who.to_string()));
                 }
@@ -436,7 +436,7 @@ impl WeChat {
         }
 
         // 2. 搜索回退 (借鉴 wxauto Ctrl+F 搜索)
-        debug!("💬 列表未找到 [{who}], 进入搜索模式");
+        debug!("[session] 列表未找到 [{who}], 进入搜索模式");
 
         // Ctrl+F 打开搜索
         engine.key_combo("ctrl+f").await?;
@@ -493,7 +493,7 @@ impl WeChat {
                 }
             }
         ).await;
-        debug!("💬 搜索切换后消息列表: {}", if loaded { "已就绪" } else { "超时" });
+        debug!("[session] 搜索切换后消息列表: {}", if loaded { "已就绪" } else { "超时" });
 
         // Esc 关闭搜索框 (借鉴 wxauto _refresh)
         engine.press_key("Escape").await?;
@@ -514,14 +514,14 @@ impl WeChat {
 
         // 验证是否切换成功
         if self.find_message_list(&app).await.is_some() {
-            debug!("💬 搜索切换成功: {who}");
+            debug!("[session] 搜索切换成功: {who}");
             // 仅缓存真正的显示名, 不缓存 chatroom ID (避免后续误跳过)
             if !who.contains("@chatroom") {
                 *self.current_chat.lock().await = Some(who.to_string());
             }
             Ok(Some(who.to_string()))
         } else {
-            info!("💬 搜索未找到结果: [{who}]");
+            info!("[session] 搜索未找到结果: [{who}]");
             *self.current_chat.lock().await = None;
             return Ok(None);
         }
@@ -539,7 +539,7 @@ impl WeChat {
         engine: &mut InputEngine,
         who: &str,
     ) -> Result<bool> {
-        info!("👂 添加监听: {who}");
+        info!("[listen] 添加监听: {who}");
 
         let app = self.find_app().await
             .ok_or_else(|| anyhow::anyhow!("找不到微信应用"))?;
@@ -549,10 +549,10 @@ impl WeChat {
             let mut windows = self.listen_windows.lock().await;
             if let Some(chatwnd) = windows.get(who) {
                 if chatwnd.is_alive().await {
-                    debug!("👂 独立窗口已存在且存活: {who}");
+                    debug!("[listen] 独立窗口已存在且存活: {who}");
                     return Ok(true);
                 } else {
-                    debug!("👂 独立窗口已失效, 移除旧记录: {who}");
+                    debug!("[listen] 独立窗口已失效, 移除旧记录: {who}");
                     windows.remove(who);
                 }
             }
@@ -565,7 +565,7 @@ impl WeChat {
             chatwnd.init_edit_box().await;
             chatwnd.init_msg_list().await;
             windows.insert(who.to_string(), chatwnd);
-            debug!("👂 找到现有独立窗口, 已注册: {who}");
+            debug!("[listen] 找到现有独立窗口, 已注册: {who}");
             return Ok(true);
         }
 
@@ -581,7 +581,7 @@ impl WeChat {
                 if let Some(bbox) = self.atspi.bbox(&item).await {
                     let (cx, cy) = bbox.center();
                     engine.double_click(cx, cy).await?;
-                    debug!("👂 双击会话弹出独立窗口: ({cx}, {cy})");
+                    debug!("[listen] 双击会话弹出独立窗口: ({cx}, {cy})");
                     // 轮询等待独立窗口出现 (替代固定 1000ms)
                     let appeared = wait_for(&self.atspi, &app, 2000, 100,
                         |atspi, app| {
@@ -603,7 +603,7 @@ impl WeChat {
                             }
                         }
                     ).await;
-                    debug!("👂 独立窗口弹出: {}", if appeared { "已检测到" } else { "超时" });
+                    debug!("[listen] 独立窗口弹出: {}", if appeared { "已检测到" } else { "超时" });
                     // 双击弹出独立窗口后, 主窗口状态已变, 重置 current_chat
                     *self.current_chat.lock().await = None;
                 }
@@ -638,10 +638,10 @@ impl WeChat {
             chatwnd.init_msg_list().await;
             let mut windows = self.listen_windows.lock().await;
             windows.insert(who.to_string(), chatwnd);
-            info!("👂 成功添加监听: {who}");
+            info!("[listen] 成功添加监听: {who}");
             return Ok(true);
         }
-        warn!("👂 轮询超时后仍未找到独立窗口: {who}");
+        warn!("[listen] 轮询超时后仍未找到独立窗口: {who}");
         Ok(false)
     }
 
@@ -649,13 +649,13 @@ impl WeChat {
     pub async fn remove_listen(&self, engine: &InputEngine, who: &str) -> bool {
         let mut windows = self.listen_windows.lock().await;
         if windows.remove(who).is_some() {
-            info!("👂 移除监听: {who}");
+            info!("[listen] 移除监听: {who}");
             drop(windows); // 释放锁
             // X11 原生关闭窗口
             match engine.close_window_by_title(who) {
-                Ok(true) => info!("👂 已关闭独立窗口: {who}"),
-                Ok(false) => info!("👂 未找到独立窗口 (可能已关闭): {who}"),
-                Err(e) => warn!("👂 X11 关闭窗口失败: {e}"),
+                Ok(true) => info!("[listen] 已关闭独立窗口: {who}"),
+                Ok(false) => info!("[listen] 未找到独立窗口 (可能已关闭): {who}"),
+                Err(e) => warn!("[listen] X11 关闭窗口失败: {e}"),
             }
             *self.current_chat.lock().await = None;
             true
@@ -685,7 +685,7 @@ impl WeChat {
                 let role = self.atspi.role(&child).await;
                 let name = self.atspi.name(&child).await;
                 if role == "frame" && name.contains(who) && !is_wechat_main(&name) {
-                    debug!("📌 找到独立聊天窗口 (app 子节点): {name}");
+                    debug!("[pin] 找到独立聊天窗口 (app 子节点): {name}");
                     return Some(child);
                 }
             }
@@ -706,14 +706,14 @@ impl WeChat {
                                 if role == "frame" {
                                     let fname = self.atspi.name(&frame).await;
                                     if fname.contains(who) {
-                                        debug!("📌 找到独立聊天窗口 (registry): {fname}");
+                                        debug!("[pin] 找到独立聊天窗口 (registry): {fname}");
                                         return Some(frame);
                                     }
                                 }
                             }
                         }
                         let role = self.atspi.role(&child).await;
-                        debug!("📌 跳过非精确匹配的节点: [{role}] {name} (内层 frame 未匹配)");
+                        debug!("[pin] 跳过非精确匹配的节点: [{role}] {name} (内层 frame 未匹配)");
                     }
                 }
             }
@@ -736,7 +736,7 @@ impl WeChat {
             if chatwnd.is_alive().await {
                 return true;
             }
-            debug!("📤 独立窗口已失效, 移除: {to}");
+            debug!("[send] 独立窗口已失效, 移除: {to}");
             windows.remove(to);
             drop(windows);
             *self.current_chat.lock().await = None;
@@ -758,18 +758,18 @@ impl WeChat {
         }
         // 注意: 这里不检查 "之前是否监听过" — 如果窗口刚被 check_listen_window 移除,
         // 说明之前确实在监听, 值得尝试恢复
-        info!("🔄 尝试自动恢复独立窗口: {to}");
+        info!("[retry] 尝试自动恢复独立窗口: {to}");
         match self.add_listen(engine, to).await {
             Ok(true) => {
-                info!("✅ 独立窗口自动恢复成功: {to}");
+                info!("[ok] 独立窗口自动恢复成功: {to}");
                 true
             }
             Ok(false) => {
-                warn!("⚠️ 独立窗口自动恢复失败: {to}");
+                warn!("[warn] 独立窗口自动恢复失败: {to}");
                 false
             }
             Err(e) => {
-                warn!("⚠️ 独立窗口自动恢复出错: {to} — {e}");
+                warn!("[warn] 独立窗口自动恢复出错: {to} — {e}");
                 false
             }
         }
@@ -804,13 +804,13 @@ impl WeChat {
         at: &[String],
         skip_verify: bool,
     ) -> Result<(bool, bool, String)> {
-        info!("📤 开始发送: [{to}] → {text} (@ {} 人)", at.len());
+        info!("[send] 开始发送: [{to}] → {text} (@ {} 人)", at.len());
 
         // 优先使用独立窗口
         if self.check_listen_window(to).await {
             let mut windows = self.listen_windows.lock().await;
             if let Some(chatwnd) = windows.get_mut(to) {
-                debug!("📤 使用独立窗口发送: {to}");
+                debug!("[send] 使用独立窗口发送: {to}");
                 // 独立窗口: 先激活并聚焦输入框, 然后 @ + 文本
                 chatwnd.activate_and_focus_input(engine).await?;
                 type_at_mentions(engine, at, self.get_at_delay_ms()).await?;
@@ -836,14 +836,14 @@ impl WeChat {
         tokio::time::sleep(ms(500)).await;
 
         let verified = if skip_verify {
-            debug!("⏩ 跳过 AT-SPI 验证 (将由 DB 验证): [{to}]");
+            debug!("[skip] 跳过 AT-SPI 验证 (将由 DB 验证): [{to}]");
             false
         } else {
             self.verify_sent(&app, text).await
         };
 
         let msg = if verified { "消息已发送" } else { "消息已发送 (未验证)" };
-        info!("✅ 完成: [{to}] verified={verified}");
+        info!("[ok] 完成: [{to}] verified={verified}");
         Ok((true, verified, msg.into()))
     }
 
@@ -854,13 +854,13 @@ impl WeChat {
         to: &str,
         image_path: &str,
     ) -> Result<(bool, bool, String)> {
-        info!("🖼️ 开始发送图片: [{to}] → {image_path}");
+        info!("[img] 开始发送图片: [{to}] → {image_path}");
 
         // 优先使用独立窗口
         if self.check_listen_window(to).await {
             let mut windows = self.listen_windows.lock().await;
             if let Some(chatwnd) = windows.get_mut(to) {
-                debug!("🖼️ 使用独立窗口发送图片: {to}");
+                debug!("[img] 使用独立窗口发送图片: {to}");
                 return chatwnd.send_image(engine, image_path).await;
             }
         }
@@ -875,7 +875,7 @@ impl WeChat {
 
         engine.press_enter().await?;
 
-        info!("✅ 图片发送完成: [{to}]");
+        info!("[ok] 图片发送完成: [{to}]");
         Ok((true, false, "图片已发送".into()))
     }
 
@@ -949,7 +949,7 @@ pub(crate) async fn verify_sent_in_list(atspi: &AtSpi, msg_list: &NodeRef, text:
                 && trimmed.len() <= text.len() * 2 + 10
                 && text.len() <= trimmed.len() * 2 + 10;
             if len_ok && (trimmed.contains(text) || text.contains(trimmed)) {
-                debug!("✅ 验证成功 (attempt {attempt})");
+                debug!("[ok] 验证成功 (attempt {attempt})");
                 return true;
             }
         }

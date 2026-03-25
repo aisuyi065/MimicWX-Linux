@@ -69,20 +69,20 @@ pub fn load_config() -> (AppConfig, Option<PathBuf>) {
             match std::fs::read_to_string(path) {
                 Ok(content) => match toml::from_str::<AppConfig>(&content) {
                     Ok(config) => {
-                        info!("⚙️ 配置文件已加载: {}", path.display());
+                        info!("[config] 配置文件已加载: {}", path.display());
                         return (config, Some(path.clone()));
                     }
                     Err(e) => {
-                        warn!("⚠️ 配置文件解析失败: {} - {}", path.display(), e);
+                        warn!("[warn] 配置文件解析失败: {} - {}", path.display(), e);
                     }
                 },
                 Err(e) => {
-                    warn!("⚠️ 配置文件读取失败: {} - {}", path.display(), e);
+                    warn!("[warn] 配置文件读取失败: {} - {}", path.display(), e);
                 }
             }
         }
     }
-    info!("⚙️ 未找到配置文件, 使用默认配置");
+    info!("[config] 未找到配置文件, 使用默认配置");
     (AppConfig::default(), None)
 }
 
@@ -91,7 +91,7 @@ pub fn save_listen_list(config_path: &std::path::Path, listen_list: &[String]) {
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
         Err(e) => {
-            warn!("⚠️ 无法读取配置文件: {e}");
+            warn!("[warn] 无法读取配置文件: {e}");
             return;
         }
     };
@@ -137,7 +137,7 @@ pub fn save_listen_list(config_path: &std::path::Path, listen_list: &[String]) {
     };
 
     match std::fs::write(config_path, new_content) {
-        Ok(_) => info!("⚙️ 监听列表已保存到 {}", config_path.display()),
-        Err(e) => warn!("⚠️ 保存配置失败: {e}"),
+        Ok(_) => info!("[config] 监听列表已保存到 {}", config_path.display()),
+        Err(e) => warn!("[warn] 保存配置失败: {e}"),
     }
 }

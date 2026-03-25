@@ -95,7 +95,7 @@ pub fn spawn_input_actor(
     mut rx: tokio::sync::mpsc::Receiver<InputCommand>,
 ) {
     tokio::spawn(async move {
-        info!("🎮 InputEngine actor 已启动");
+        info!("[input] InputEngine actor 已启动");
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 InputCommand::SendMessage { to, text, at, skip_verify, reply } => {
@@ -128,7 +128,7 @@ pub fn spawn_input_actor(
                 }
             }
         }
-        info!("🎮 InputEngine actor 已停止");
+        info!("[input] InputEngine actor 已停止");
     });
 }
 
@@ -633,7 +633,7 @@ async fn exec_command(
     Json(req): Json<CommandReq>,
 ) -> impl IntoResponse {
     let cmd = req.cmd.trim();
-    info!("🎮 收到远程命令: {cmd}");
+    info!("[input] 收到远程命令: {cmd}");
 
     let result = match cmd {
         "status" => {
@@ -663,7 +663,7 @@ async fn exec_command(
         _ if cmd.starts_with("listen ") => {
             let who = cmd.strip_prefix("listen ").unwrap().trim();
             if who.is_empty() {
-                "❌ 用法: listen <联系人/群名>".to_string()
+                "[err] 用法: listen <联系人/群名>".to_string()
             } else {
                 exec_listen(&state, who).await
             }
@@ -671,7 +671,7 @@ async fn exec_command(
         _ if cmd.starts_with("unlisten ") => {
             let who = cmd.strip_prefix("unlisten ").unwrap().trim();
             if who.is_empty() {
-                "❌ 用法: unlisten <联系人/群名>".to_string()
+                "[err] 用法: unlisten <联系人/群名>".to_string()
             } else {
                 exec_unlisten(&state, who).await
             }
@@ -681,13 +681,13 @@ async fn exec_command(
             if let Some((to, text)) = rest.split_once(' ') {
                 exec_send(&state, to.trim(), text.trim()).await
             } else {
-                "❌ 用法: send <收件人> <内容>".to_string()
+                "[err] 用法: send <收件人> <内容>".to_string()
             }
         }
         _ => format!("❓ 未知命令: {cmd}"),
     };
 
-    info!("🎮 命令结果: {result}");
+    info!("[input] 命令结果: {result}");
     Json(serde_json::json!({ "ok": true, "result": result }))
 }
 
@@ -695,15 +695,15 @@ async fn exec_command(
 async fn exec_reload(state: &AppState) -> String {
     let path = match &state.config_path {
         Some(p) => p,
-        None => return "⚠️ 未找到配置文件路径".to_string(),
+        None => return "[warn] 未找到配置文件路径".to_string(),
     };
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) => return format!("⚠️ 读取配置失败: {e}"),
+        Err(e) => return format!("[warn] 读取配置失败: {e}"),
     };
     let new_config: crate::config::AppConfig = match toml::from_str(&content) {
         Ok(c) => c,
-        Err(e) => return format!("⚠️ 配置解析失败: {e}"),
+        Err(e) => return format!("[warn] 配置解析失败: {e}"),
     };
 
     let mut lines = Vec::new();
@@ -713,7 +713,7 @@ async fn exec_reload(state: &AppState) -> String {
     let new = new_config.timing.at_delay_ms;
     if old != new {
         state.wechat.set_at_delay_ms(new);
-        lines.push(format!("⚙️ at_delay_ms: {old} → {new}"));
+        lines.push(format!("[config] at_delay_ms: {old} → {new}"));
     }
 
     // Diff listen 列表
@@ -729,7 +729,7 @@ async fn exec_reload(state: &AppState) -> String {
         }).await.is_ok() {
             let _ = reply_rx.await;
         }
-        lines.push(format!("👂 移除监听: {who}"));
+        lines.push(format!("[listen] 移除监听: {who}"));
     }
     for who in &to_add {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -737,17 +737,17 @@ async fn exec_reload(state: &AppState) -> String {
             who: who.clone(), reply: reply_tx,
         }).await.is_ok() {
             match reply_rx.await {
-                Ok(Ok(true)) => lines.push(format!("✅ 添加监听: {who}")),
-                _ => lines.push(format!("⚠️ 添加失败: {who}")),
+                Ok(Ok(true)) => lines.push(format!("[ok] 添加监听: {who}")),
+                _ => lines.push(format!("[warn] 添加失败: {who}")),
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 
     if lines.is_empty() {
-        "⚙️ 配置已重载 (无变化)".to_string()
+        "[config] 配置已重载 (无变化)".to_string()
     } else {
-        lines.push("⚙️ 配置已重载".to_string());
+        lines.push("[config] 配置已重载".to_string());
         lines.join("\n")
     }
 }
@@ -758,7 +758,7 @@ async fn exec_listen(state: &AppState, who: &str) -> String {
     if state.input_tx.send(InputCommand::AddListen {
         who: who.to_string(), reply: reply_tx,
     }).await.is_err() {
-        return "⚠️ InputEngine 不可用".to_string();
+        return "[warn] InputEngine 不可用".to_string();
     }
     match reply_rx.await {
         Ok(Ok(true)) => {
@@ -768,11 +768,11 @@ async fn exec_listen(state: &AppState, who: &str) -> String {
                 if !list.contains(&who.to_string()) { list.push(who.to_string()); }
                 crate::config::save_listen_list(path, &list);
             }
-            format!("✅ 监听已添加: {who}")
+            format!("[ok] 监听已添加: {who}")
         }
-        Ok(Ok(false)) => format!("⚠️ 添加失败: {who}"),
-        Ok(Err(e)) => format!("⚠️ 错误: {e}"),
-        Err(_) => "⚠️ actor 响应通道已关闭".to_string(),
+        Ok(Ok(false)) => format!("[warn] 添加失败: {who}"),
+        Ok(Err(e)) => format!("[warn] 错误: {e}"),
+        Err(_) => "[warn] actor 响应通道已关闭".to_string(),
     }
 }
 
@@ -782,7 +782,7 @@ async fn exec_unlisten(state: &AppState, who: &str) -> String {
     if state.input_tx.send(InputCommand::RemoveListen {
         who: who.to_string(), reply: reply_tx,
     }).await.is_err() {
-        return "⚠️ InputEngine 不可用".to_string();
+        return "[warn] InputEngine 不可用".to_string();
     }
     match reply_rx.await {
         Ok(true) => {
@@ -792,10 +792,10 @@ async fn exec_unlisten(state: &AppState, who: &str) -> String {
                 list.retain(|n| n != who);
                 crate::config::save_listen_list(path, &list);
             }
-            format!("✅ 监听已移除: {who}")
+            format!("[ok] 监听已移除: {who}")
         }
-        Ok(false) => format!("⚠️ 未找到监听: {who}"),
-        Err(_) => "⚠️ actor 响应通道已关闭".to_string(),
+        Ok(false) => format!("[warn] 未找到监听: {who}"),
+        Err(_) => "[warn] actor 响应通道已关闭".to_string(),
     }
 }
 
@@ -808,12 +808,12 @@ async fn exec_send(state: &AppState, to: &str, text: &str) -> String {
         at: vec![], skip_verify: has_db,
         reply: reply_tx,
     }).await.is_err() {
-        return "⚠️ InputEngine 不可用".to_string();
+        return "[warn] InputEngine 不可用".to_string();
     }
     match reply_rx.await {
-        Ok(Ok((true, _, msg))) => format!("✅ {msg}"),
-        Ok(Ok((false, _, msg))) => format!("⚠️ {msg}"),
-        Ok(Err(e)) => format!("⚠️ 发送失败: {e}"),
-        Err(_) => "⚠️ actor 响应通道已关闭".to_string(),
+        Ok(Ok((true, _, msg))) => format!("[ok] {msg}"),
+        Ok(Ok((false, _, msg))) => format!("[warn] {msg}"),
+        Ok(Err(e)) => format!("[warn] 发送失败: {e}"),
+        Err(_) => "[warn] actor 响应通道已关闭".to_string(),
     }
 }

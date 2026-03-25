@@ -37,23 +37,23 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("🚀 MimicWX-Linux v{} 启动中...", env!("CARGO_PKG_VERSION"));
+    info!("[init] MimicWX-Linux v{} 启动中...", env!("CARGO_PKG_VERSION"));
 
     // ① 加载配置文件
     let (config, config_path) = config::load_config();
     if !config.listen.auto.is_empty() {
-        debug!("📋 自动监听列表: {:?}", config.listen.auto);
+        debug!("[table] 自动监听列表: {:?}", config.listen.auto);
     }
 
     // ② AT-SPI2 连接 (仍用于发送消息, 带重试)
     let atspi = loop {
         match atspi::AtSpi::connect().await {
             Ok(a) => {
-                info!("✅ AT-SPI2 连接就绪");
+                info!("[ok] AT-SPI2 连接就绪");
                 break Arc::new(a);
             }
             Err(e) => {
-                warn!("⚠️ AT-SPI2 连接失败: {}, 5秒后重试...", e);
+                warn!("[warn] AT-SPI2 连接失败: {}, 5秒后重试...", e);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
@@ -62,11 +62,11 @@ async fn main() -> Result<()> {
     // ③ X11 XTEST 输入引擎 (仅发送消息需要, 非必须)
     let engine = match input::InputEngine::new() {
         Ok(e) => {
-            info!("✅ X11 XTEST 输入引擎就绪");
+            info!("[ok] X11 XTEST 输入引擎就绪");
             Some(e)
         }
         Err(e) => {
-            warn!("⚠️ X11 输入引擎不可用 (发送消息功能受限): {}", e);
+            warn!("[warn] X11 输入引擎不可用 (发送消息功能受限): {}", e);
             None
         }
     };
@@ -81,11 +81,11 @@ async fn main() -> Result<()> {
         let status = wechat.check_status().await;
         match status {
             wechat::WeChatStatus::LoggedIn => {
-                info!("✅ 微信已登录");
+                info!("[ok] 微信已登录");
                 break;
             }
             wechat::WeChatStatus::NotRunning if attempts < 30 => {
-                debug!("⏳ 等待微信启动... ({}/30)", attempts + 1);
+                debug!("[wait] 等待微信启动... ({}/30)", attempts + 1);
                 if attempts % 5 == 4 {
                     wechat.try_reconnect().await;
                 }
@@ -94,8 +94,8 @@ async fn main() -> Result<()> {
             }
             wechat::WeChatStatus::WaitingForLogin => {
                 if !login_prompted {
-                    info!("📱 请通过 noVNC (http://localhost:6080/vnc.html) 扫码登录微信");
-                    info!("🔑 GDB 密钥提取已在后台运行, 登录后将自动获取数据库密钥");
+                    info!("[login] 请通过 noVNC (http://localhost:6080/vnc.html) 扫码登录微信");
+                    info!("[key] GDB 密钥提取已在后台运行, 登录后将自动获取数据库密钥");
                     login_prompted = true;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -108,13 +108,13 @@ async fn main() -> Result<()> {
 
     // ⑥ 读取数据库密钥 (内存扫描提取) + 初始化 DbManager
     // 优先检查持久化路径, 回退到 /tmp (兼容)
-    let key_paths = ["/home/wechat/.cache/wechat_key.txt", "/tmp/wechat_key.txt"];
+    let key_paths = ["/home/wechat/.xwechat/wechat_key.txt", "/tmp/wechat_key.txt"];
     for i in 0..10 {
         if key_paths.iter().any(|p| std::path::Path::new(p).exists()) {
             break;
         }
         if i == 0 {
-            info!("🔑 等待密钥提取...");
+            info!("[key] 等待密钥提取...");
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
         Ok(key) => {
             let key = key.trim().to_string();
             if key.len() == 96 || key.len() == 64 {
-                info!("🔑 数据库密钥已获取 ({}...{}) [{}hex]", &key[..8], &key[key.len()-8..], key.len());
+                info!("[key] 数据库密钥已获取 ({}...{}) [{}hex]", &key[..8], &key[key.len()-8..], key.len());
 
                 // 查找数据库目录
                 let db_dir = find_db_dir();
@@ -148,10 +148,10 @@ async fn main() -> Result<()> {
                                             Ok(()) => { ok = true; break; }
                                             Err(e) => {
                                                 if attempt < 9 {
-                                                    debug!("⏳ 消息数据库尚未就绪 (第{}次), {}秒后重试: {}",
+                                                    debug!("[wait] 消息数据库尚未就绪 (第{}次), {}秒后重试: {}",
                                                         attempt + 1, 3, e);
                                                 } else {
-                                                    warn!("⚠️ 标记已读失败 (已重试10次): {}", e);
+                                                    warn!("[warn] 标记已读失败 (已重试10次): {}", e);
                                                 }
                                             }
                                         }
@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
                                 };
                                 // 联系人加载 (在消息表就绪后执行, 或独立尝试)
                                 if let Err(e) = mgr.refresh_contacts().await {
-                                    warn!("⚠️ 联系人加载失败 (可能尚无数据): {}", e);
+                                    warn!("[warn] 联系人加载失败 (可能尚无数据): {}", e);
                                 }
                                 if !mark_ok {
                                     info!("ℹ️ 消息数据库将在收到首条消息时自动连接");
@@ -168,23 +168,23 @@ async fn main() -> Result<()> {
                                 Some(mgr)
                             }
                             Err(e) => {
-                                warn!("⚠️ DbManager 初始化失败: {}", e);
+                                warn!("[warn] DbManager 初始化失败: {}", e);
                                 None
                             }
                         }
                     }
                     None => {
-                        warn!("⚠️ 未找到微信数据库目录, 数据库监听不可用");
+                        warn!("[warn] 未找到微信数据库目录, 数据库监听不可用");
                         None
                     }
                 }
             } else {
-                warn!("⚠️ 密钥文件格式异常 (长度: {}), 跳过", key.len());
+                warn!("[warn] 密钥文件格式异常 (长度: {}), 跳过", key.len());
                 None
             }
         }
         Err(_) => {
-            warn!("⚠️ 未找到密钥文件, 数据库解密功能不可用");
+            warn!("[warn] 未找到密钥文件, 数据库解密功能不可用");
             None
         }
     };
@@ -199,7 +199,7 @@ async fn main() -> Result<()> {
     if let Some(eng) = engine {
         api::spawn_input_actor(eng, wechat.clone(), input_rx);
     } else {
-        warn!("⚠️ X11 输入引擎不可用, InputEngine actor 未启动");
+        warn!("[warn] X11 输入引擎不可用, InputEngine actor 未启动");
     }
 
     let state = Arc::new(api::AppState {
@@ -217,11 +217,11 @@ async fn main() -> Result<()> {
     let addr = "0.0.0.0:8899";
     info!("🌐 API 服务启动: http://{addr}");
     info!("📡 WebSocket: ws://{addr}/ws");
-    info!("📌 端点: /status, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
+    info!("[pin] 端点: /status, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
     if state.api_token.is_some() {
         info!("🔒 API 认证已启用 (Bearer Token)");
     } else {
-        warn!("⚠️ API 认证未启用 (config.toml [api] token 未配置)");
+        warn!("[warn] API 认证未启用 (config.toml [api] token 未配置)");
     }
 
     // 退出码: 0=正常退出, 42=重启
@@ -290,8 +290,8 @@ async fn main() -> Result<()> {
                 loop {
                     interval.tick().await;
                     match refresh_db.refresh_contacts().await {
-                        Ok(n) => debug!("👥 联系人定时刷新完成: {} 条", n),
-                        Err(e) => warn!("⚠️ 联系人定时刷新失败: {}", e),
+                        Ok(n) => debug!("[contacts] 联系人定时刷新完成: {} 条", n),
+                        Err(e) => warn!("[warn] 联系人定时刷新失败: {}", e),
                     }
                 }
             });
@@ -301,7 +301,7 @@ async fn main() -> Result<()> {
         let mut wal_rx = db.spawn_wal_watcher();
 
         tokio::spawn(async move {
-            info!("👂 数据库消息监听启动 (fanotify PID 过滤)");
+            info!("[listen] 数据库消息监听启动 (fanotify PID 过滤)");
 
             loop {
                 // 等待 WAL 变化通知 (fanotify 已过滤自身事件, 无需防抖)
@@ -311,7 +311,7 @@ async fn main() -> Result<()> {
                 ).await {
                     Ok(Ok(())) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
                     Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                        error!("❌ WAL 监听通道关闭");
+                        error!("[err] WAL 监听通道关闭");
                         break;
                     }
                     Err(_) => {
@@ -348,7 +348,7 @@ async fn main() -> Result<()> {
             }
         });
     } else {
-        warn!("⚠️ 数据库密钥不可用, 消息监听功能未启动");
+        warn!("[warn] 数据库密钥不可用, 消息监听功能未启动");
     }
 
     // ⑩ 自动监听任务 (配置文件中的 auto listen 列表)
@@ -358,7 +358,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             // 等待 API 服务就绪 + 微信窗口稳定
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            info!("📋 开始自动添加监听 ({} 个目标)...", auto_targets.len());
+            info!("[table] 开始自动添加监听 ({} 个目标)...", auto_targets.len());
 
             for target in &auto_targets {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -366,20 +366,20 @@ async fn main() -> Result<()> {
                     who: target.clone(),
                     reply: reply_tx,
                 }).await.is_err() {
-                    warn!("⚠️ InputEngine actor 已停止, 无法自动添加监听");
+                    warn!("[warn] InputEngine actor 已停止, 无法自动添加监听");
                     break;
                 }
                 match reply_rx.await {
-                    Ok(Ok(true)) => info!("✅ 自动监听已添加: {}", target),
-                    Ok(Ok(false)) => warn!("⚠️ 自动监听添加失败: {}", target),
-                    Ok(Err(e)) => warn!("⚠️ 自动监听错误: {} - {}", target, e),
-                    Err(_) => warn!("⚠️ actor 响应通道已关闭"),
+                    Ok(Ok(true)) => info!("[ok] 自动监听已添加: {}", target),
+                    Ok(Ok(false)) => warn!("[warn] 自动监听添加失败: {}", target),
+                    Ok(Err(e)) => warn!("[warn] 自动监听错误: {} - {}", target, e),
+                    Err(_) => warn!("[warn] actor 响应通道已关闭"),
                 }
                 // 每个目标间隔 3 秒, 给微信窗口时间稳定
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
 
-            info!("📋 自动监听配置完成");
+            info!("[table] 自动监听配置完成");
         });
     }
 
@@ -400,7 +400,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     // 打印控制台命令提示
-    info!("💡 控制台命令: /restart /stop /status /refresh /help");
+    info!("[help] 控制台命令: /restart /stop /status /refresh /help");
 
     // 优雅退出: 监听 shutdown 信号 + Ctrl+C
     let mut shutdown_rx = shutdown_tx_clone.subscribe();
@@ -420,7 +420,7 @@ async fn main() -> Result<()> {
 
     let code = exit_code.load(Ordering::Relaxed);
     if code == 42 {
-        info!("🔄 MimicWX 准备重启...");
+        info!("[retry] MimicWX 准备重启...");
     } else {
         info!("👋 MimicWX 已停止");
     }

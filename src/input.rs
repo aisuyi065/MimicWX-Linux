@@ -67,7 +67,7 @@ pub struct InputEngine {
 impl InputEngine {
     /// 创建输入引擎
     pub fn new() -> Result<Self> {
-        info!("🎮 初始化 X11 XTEST 输入引擎...");
+        info!("[input] 初始化 X11 XTEST 输入引擎...");
 
         let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
         let (conn, screen_num) = RustConnection::connect(Some(&display_env))
@@ -102,7 +102,7 @@ impl InputEngine {
         let atom_clipboard = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
         let atom_targets = conn.intern_atom(false, b"TARGETS")?.reply()?.atom;
 
-        info!("✅ X11 XTEST 就绪 (DISPLAY={display_env}, keycodes={min_keycode}~{max_keycode})");
+        info!("[ok] X11 XTEST 就绪 (DISPLAY={display_env}, keycodes={min_keycode}~{max_keycode})");
 
         Ok(Self {
             conn, screen_root, min_keycode, max_keycode, keysyms_per_keycode, keysyms,
@@ -208,7 +208,7 @@ impl InputEngine {
 
         if let Some(skc) = shift_kc { self.raw_key_release(skc)?; }
 
-        debug!("⌨️ press_key: {key_name}");
+        debug!("[kbd] press_key: {key_name}");
         Ok(())
     }
 
@@ -235,7 +235,7 @@ impl InputEngine {
             self.raw_key_release(kc)?;
         }
 
-        debug!("⌨️ key_combo: {combo}");
+        debug!("[kbd] key_combo: {combo}");
         Ok(())
     }
 
@@ -268,7 +268,7 @@ impl InputEngine {
     }
 
     async fn clipboard_paste(&mut self, text: &str) -> Result<()> {
-        info!("📋 粘贴文本: {} 字符", text.len());
+        info!("[table] 粘贴文本: {} 字符", text.len());
 
         // 使用 X11 Selection 协议设置剪贴板 (无需 xclip 子进程)
         // 流程: spawn_blocking 中获取 CLIPBOARD ownership + 事件循环
@@ -412,7 +412,7 @@ impl InputEngine {
 
     /// 通过剪贴板粘贴图片文件 (xclip + Ctrl+V)
     pub async fn paste_image(&mut self, image_path: &str) -> Result<()> {
-        info!("🖼️ 粘贴图片: {}", image_path);
+        info!("[img] 粘贴图片: {}", image_path);
 
         // 检测 MIME 类型
         let mime = if image_path.ends_with(".png") {
@@ -455,7 +455,7 @@ impl InputEngine {
     pub async fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
         self.conn.xtest_fake_input(MOTION_NOTIFY, 0, 0, self.screen_root, x as i16, y as i16, 0)?;
         self.conn.flush()?;
-        debug!("🖱️ move_mouse: ({x}, {y})");
+        debug!("[mouse] move_mouse: ({x}, {y})");
         Ok(())
     }
 
@@ -473,7 +473,7 @@ impl InputEngine {
         self.conn.xtest_fake_input(BUTTON_RELEASE, 1, 0, self.screen_root, 0, 0, 0)?;
         self.conn.flush()?;
 
-        debug!("🖱️ click: ({x}, {y})");
+        debug!("[mouse] click: ({x}, {y})");
         Ok(())
     }
 
@@ -497,7 +497,7 @@ impl InputEngine {
         self.conn.xtest_fake_input(BUTTON_RELEASE, 3, 0, self.screen_root, 0, 0, 0)?;
         self.conn.flush()?;
 
-        debug!("🖱️ right_click: ({x}, {y})");
+        debug!("[mouse] right_click: ({x}, {y})");
         Ok(())
     }
 
@@ -516,7 +516,7 @@ impl InputEngine {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        debug!("🖱️ scroll: ({x}, {y}) clicks={clicks}");
+        debug!("[mouse] scroll: ({x}, {y}) clicks={clicks}");
         Ok(())
     }
 
@@ -587,7 +587,7 @@ impl InputEngine {
     pub fn activate_window_by_title(&self, title: &str, exact: bool) -> Result<bool> {
         let windows = self.find_windows_by_title(title, exact)?;
         if let Some((win, name)) = windows.first() {
-            debug!("🖱️ 激活窗口: '{name}' (wid={win})");
+            debug!("[mouse] 激活窗口: '{name}' (wid={win})");
             let active_atom = self.atom_net_active_window;
             // _NET_ACTIVE_WINDOW: data[0]=source(1=app), data[1]=timestamp, data[2]=requestor
             let event = ClientMessageEvent {
@@ -607,7 +607,7 @@ impl InputEngine {
             self.conn.flush()?;
             Ok(true)
         } else {
-            debug!("🖱️ 未找到标题匹配 '{title}' 的窗口");
+            debug!("[mouse] 未找到标题匹配 '{title}' 的窗口");
             Ok(false)
         }
     }
@@ -616,7 +616,7 @@ impl InputEngine {
     pub fn close_window_by_title(&self, title: &str) -> Result<bool> {
         let windows = self.find_windows_by_title(title, false)?;
         if let Some((win, name)) = windows.first() {
-            info!("🗑️ 关闭窗口: '{name}' (匹配 '{title}')");
+            info!("[close] 关闭窗口: '{name}' (匹配 '{title}')");
             let close_atom = self.atom_net_close_window;
             let event = ClientMessageEvent {
                 response_type: xproto::CLIENT_MESSAGE_EVENT,
@@ -635,7 +635,7 @@ impl InputEngine {
             self.conn.flush()?;
             Ok(true)
         } else {
-            debug!("🗑️ 未找到标题包含 '{title}' 的窗口");
+            debug!("[close] 未找到标题包含 '{title}' 的窗口");
             Ok(false)
         }
     }

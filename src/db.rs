@@ -14,12 +14,24 @@
 //! 策略: 所有 DB 操作在 spawn_blocking 中完成, 异步方法只操作缓存。
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
+
+// =====================================================================
+// 常量
+// =====================================================================
+
+/// SQLite busy_timeout (ms)
+const DB_BUSY_TIMEOUT_MS: u32 = 5000;
+/// 发送验证超时
+const SEND_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// WAL 目录/文件等待轮询间隔
+const WAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 // =====================================================================
 // FFI: sqlite3_key (WCDB 密钥传递方式)
@@ -222,8 +234,8 @@ pub struct DbManager {
     rescan_count: std::sync::atomic::AtomicU32,
     /// 当前账号的显示名 (从联系人库查询, 默认 "我")
     self_display_name: tokio::sync::RwLock<String>,
-    /// 联系人缓存: username → ContactInfo
-    contacts: Mutex<HashMap<String, ContactInfo>>,
+    /// 联系人缓存: username → ContactInfo (ArcSwap 快照, 读取零竞争)
+    contacts: ArcSwap<HashMap<String, ContactInfo>>,
     /// 高水位线: "db_name::表名" → 最大 local_id (多数据库区分)
     watermarks: Mutex<HashMap<String, i64>>,
     /// 持久化 message_N.db 连接池 (避免每次查询重做 PBKDF2 ~500ms)
@@ -250,7 +262,7 @@ impl DbManager {
         anyhow::ensure!(key_bytes.len() == 32 || key_bytes.len() == 48,
             "密钥长度必须为 32 或 48 字节, 实际: {}", key_bytes.len());
 
-        info!("📦 DbManager 初始化: db_dir={}", db_dir.display());
+        info!("[db] DbManager 初始化: db_dir={}", db_dir.display());
 
         // 从 db_dir 路径提取自己的 wxid
         // 路径格式: .../wxid_xxx_c024/db_storage
@@ -275,7 +287,7 @@ impl DbManager {
             })
             .unwrap_or_default();
         if !self_wxid.is_empty() {
-            info!("👤 当前账号: {}", self_wxid);
+            info!("[user] 当前账号: {}", self_wxid);
         }
 
         // 自动发现并连接所有 message_N.db
@@ -289,11 +301,11 @@ impl DbManager {
                         let rel_path = format!("message/{}", name);
                         match Self::open_db(&key_hex, &key_bytes, &db_dir, &rel_path) {
                             Ok(conn) => {
-                                info!("🔗 {} 持久连接已建立", name);
+                                info!("[conn] {} 持久连接已建立", name);
                                 conns.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
                             }
                             Err(e) => {
-                                info!("⚠️ {} 暂不可用 (将在查询时重试): {}", name, e);
+                                info!("[warn] {} 暂不可用 (将在查询时重试): {}", name, e);
                             }
                         }
                     }
@@ -301,7 +313,7 @@ impl DbManager {
             }
         }
         if conns.is_empty() {
-            warn!("⚠️ 未发现可用的 message 数据库 (将在首次查询时重试)");
+            warn!("[warn] 未发现可用的 message 数据库 (将在首次查询时重试)");
         } else {
             info!("📂 已连接 {} 个消息数据库", conns.len());
         }
@@ -314,7 +326,7 @@ impl DbManager {
             db_dir,
             self_wxid,
             self_display_name: tokio::sync::RwLock::new("我".to_string()),
-            contacts: Mutex::new(HashMap::new()),
+            contacts: ArcSwap::from_pointee(HashMap::new()),
             watermarks: Mutex::new(HashMap::new()),
             msg_conns: std::sync::Mutex::new(conns),
             contact_conn: Arc::new(std::sync::Mutex::new(None)),
@@ -348,7 +360,7 @@ impl DbManager {
 
     /// 读取 wechat_keys.json (优先持久化路径, 回退 /tmp)
     fn read_keys_json() -> Option<std::collections::HashMap<String, String>> {
-        for path in &["/home/wechat/.cache/wechat_keys.json", "/tmp/wechat_keys.json"] {
+        for path in &["/home/wechat/.xwechat/wechat_keys.json", "/tmp/wechat_keys.json"] {
             if let Ok(content) = std::fs::read_to_string(path) {
                 if let Ok(map) = serde_json::from_str(&content) {
                     return Some(map);
@@ -397,7 +409,7 @@ impl DbManager {
         conn.execute_batch("PRAGMA cipher_compatibility = 4;")?;
         conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")?;
         conn.execute_batch("PRAGMA query_only = ON;")?;
-        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        conn.execute_batch(&format!("PRAGMA busy_timeout = {};", DB_BUSY_TIMEOUT_MS))?;
 
         let count: i32 = conn.query_row(
             "SELECT count(*) FROM sqlite_master", [], |row| row.get(0),
@@ -418,7 +430,7 @@ impl DbManager {
             if let Ok(conn) = Self::try_open_db_with_key(&path, db_name, &db_key, &bytes) {
                 return Ok(conn);
             }
-            debug!("🔑 {} 专属密钥解密失败, 尝试其他密钥...", db_name);
+            debug!("[key] {} 专属密钥解密失败, 尝试其他密钥...", db_name);
         }
 
         // 2. 尝试默认密钥
@@ -436,7 +448,7 @@ impl DbManager {
                 Err(_) => continue,
             };
             if let Ok(conn) = Self::try_open_db_with_key(&path, db_name, candidate, &bytes) {
-                info!("🔑 {} 通过暴力匹配找到正确密钥", db_name);
+                info!("[key] {} 通过暴力匹配找到正确密钥", db_name);
                 return Ok(conn);
             }
         }
@@ -450,9 +462,9 @@ impl DbManager {
         if guard.is_empty() {
             let count = self.rescan_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if count == 0 {
-                info!("🔗 重新扫描 message 数据库...");
+                info!("[conn] 重新扫描 message 数据库...");
             } else {
-                debug!("🔗 重新扫描 message 数据库... (第{}次)", count + 1);
+                debug!("[conn] 重新扫描 message 数据库... (第{}次)", count + 1);
             }
             let msg_dir = self.db_dir.join("message");
             if msg_dir.exists() {
@@ -463,7 +475,7 @@ impl DbManager {
                             let rel_path = format!("message/{}", name);
                             if !guard.contains_key(&rel_path) {
                                 if let Ok(conn) = Self::open_db(&self.key_hex, &self.key_bytes, &self.db_dir, &rel_path) {
-                                    info!("🔗 {} 持久连接已建立", name);
+                                    info!("[conn] {} 持久连接已建立", name);
                                     guard.insert(rel_path, Arc::new(std::sync::Mutex::new(conn)));
                                 }
                             }
@@ -496,7 +508,7 @@ impl DbManager {
             let mut guard = conn_mutex.lock().map_err(|e| anyhow::anyhow!("contact_conn lock: {}", e))?;
             if guard.is_none() {
                 *guard = Some(Self::open_db(&kh, &key, &dir, "contact/contact.db")?);  
-                info!("🔗 contact.db 持久连接已建立");
+                info!("[conn] contact.db 持久连接已建立");
             }
             let conn = guard.as_ref().unwrap();
             let mut stmt = conn.prepare(
@@ -522,21 +534,21 @@ impl DbManager {
                 Ok(ContactInfo { username, nick_name, remark, alias, display_name })
             })?.filter_map(|r| match r {
                 Ok(c) => Some(c),
-                Err(e) => { warn!("⚠️ 联系人行读取失败: {}", e); None }
+                Err(e) => { warn!("[warn] 联系人行读取失败: {}", e); None }
             }).collect();
             Ok(result)
         }).await??;
 
         let count = contacts.len();
-        // 短暂持锁: 清空并填入联系人
+        // 原子替换联系人快照 (无锁)
         {
-            let mut cache = self.contacts.lock().await;
-            cache.clear();
+            let mut new_map = HashMap::with_capacity(contacts.len());
             for c in contacts {
-                cache.insert(c.username.clone(), c);
+                new_map.insert(c.username.clone(), c);
             }
-        } // 锁在此释放, 不阻塞 get_new_messages 等热路径
-        info!("👥 联系人缓存: {} 条", count);
+            self.contacts.store(Arc::new(new_map));
+        }
+        info!("[contacts] 联系人缓存: {} 条", count);
 
         // 从 chat_room 表补充群名 (锁已释放, spawn_blocking 不会阻塞读操作)
         let chatrooms = {
@@ -560,7 +572,7 @@ impl DbManager {
 
                         for (id, name) in rows {
                             if !id.is_empty() && !name.is_empty() {
-                                debug!("👥 chat_room 补充: {} → {}", id, name);
+                                debug!("[contacts] chat_room 补充: {} → {}", id, name);
                                 result.push((id, name));
                             }
                         }
@@ -572,13 +584,14 @@ impl DbManager {
             }).await.unwrap_or_else(|_| Ok(vec![])).unwrap_or_default()
         };
 
-        // 短暂持锁: 补充群名
+        // 原子替换: 补充群名到快照
         if !chatrooms.is_empty() {
-            let mut cache = self.contacts.lock().await;
+            let old = self.contacts.load();
+            let mut new_map = (**old).clone();
             let mut added = 0usize;
             for (chatroom_id, nick_name) in chatrooms {
-                if !cache.contains_key(&chatroom_id) {
-                    cache.insert(chatroom_id.clone(), ContactInfo {
+                if !new_map.contains_key(&chatroom_id) {
+                    new_map.insert(chatroom_id.clone(), ContactInfo {
                         username: chatroom_id,
                         nick_name: nick_name.clone(),
                         remark: String::new(),
@@ -589,17 +602,18 @@ impl DbManager {
                 }
             }
             if added > 0 {
-                info!("👥 群聊名称补充: {} 条", added);
+                self.contacts.store(Arc::new(new_map));
+                info!("[contacts] 群聊名称补充: {} 条", added);
             }
         }
 
-        // 尝试解析当前账号的显示名 (短暂持锁读取, 然后释放)
+        // 尝试解析当前账号的显示名 (快照读取, 无锁)
         if !self.self_wxid.is_empty() {
-            let name = self.contacts.lock().await
+            let name = self.contacts.load()
                 .get(&self.self_wxid)
                 .map(|c| c.display_name.clone());
             if let Some(name) = name {
-                info!("👤 当前账号昵称: {} ({})", name, self.self_wxid);
+                info!("[user] 当前账号昵称: {} ({})", name, self.self_wxid);
                 *self.self_display_name.write().await = name;
             }
         }
@@ -610,12 +624,12 @@ impl DbManager {
 
     /// 获取联系人列表
     pub async fn get_contacts(&self) -> Vec<ContactInfo> {
-        self.contacts.lock().await.values().cloned().collect()
+        self.contacts.load().values().cloned().collect()
     }
 
     /// 通过 username 获取显示名
     async fn resolve_name(&self, username: &str) -> String {
-        self.contacts.lock().await
+        self.contacts.load()
             .get(username)
             .map(|c| c.display_name.clone())
             .unwrap_or_else(|| username.to_string())
@@ -637,7 +651,7 @@ impl DbManager {
             let mut guard = conn_mutex.lock().map_err(|e| anyhow::anyhow!("session_conn lock: {}", e))?;
             if guard.is_none() {
                 *guard = Some(Self::open_db(&kh, &key, &dir, "session/session.db")?);  
-                info!("🔗 session.db 持久连接已建立");
+                info!("[conn] session.db 持久连接已建立");
             }
             let conn = guard.as_ref().unwrap();
             let mut stmt = conn.prepare(
@@ -714,7 +728,7 @@ impl DbManager {
                     } else {
                         // 新表: PRAGMA 获取列结构
                         if let Some(meta) = build_single_table_meta(&conn, table) {
-                            info!("📋 {} 新增表结构缓存: {}", db_name, table);
+                            info!("[table] {} 新增表结构缓存: {}", db_name, table);
                             meta_cache.insert(cache_key, meta.clone());
                             table_metas.push(meta);
                         }
@@ -727,7 +741,7 @@ impl DbManager {
 
                     let mut stmt = match conn.prepare(&meta.select_sql) {
                         Ok(s) => s,
-                        Err(e) => { warn!("⚠️ 查询 {} ({}) 失败: {}", meta.table, db_name, e); continue; }
+                        Err(e) => { warn!("[warn] 查询 {} ({}) 失败: {}", meta.table, db_name, e); continue; }
                     };
                     let msgs: Vec<(i64, i64, i64, String, i64, String, i64, String)> = match stmt
                         .query_map([last_id], |row| {
@@ -766,9 +780,9 @@ impl DbManager {
                         }) {
                         Ok(rows) => rows.filter_map(|r| match r {
                             Ok(v) => Some(v),
-                            Err(e) => { warn!("⚠️ 行解析失败: {}", e); None }
+                            Err(e) => { warn!("[warn] 行解析失败: {}", e); None }
                         }).collect(),
-                        Err(e) => { warn!("⚠️ query_map {} ({}) 失败: {}", meta.table, db_name, e); continue; }
+                        Err(e) => { warn!("[warn] query_map {} ({}) 失败: {}", meta.table, db_name, e); continue; }
                     };
 
                     if !msgs.is_empty() {
@@ -804,7 +818,7 @@ impl DbManager {
         }
 
         // 异步填充显示名 (批量: 一次锁定联系人缓存, 避免 N×2 次锁竞争)
-        let contacts_cache = self.contacts.lock().await;
+        let contacts_cache = self.contacts.load();
         let self_display = self.self_display_name.read().await.clone();
         let resolve = |username: &str| -> String {
             contacts_cache
@@ -901,7 +915,7 @@ impl DbManager {
 
         for m in &result {
             let preview = m.parsed.preview(40);
-            let icon = if m.is_self { "📤 →" } else { "📨" };
+            let icon = if m.is_self { "[send] →" } else { "" };
             if m.chat.contains("@chatroom") {
                 info!("{icon} [{}] {}({}): {}",
                     m.chat_display_name, m.talker_display_name, m.talker, preview);
@@ -946,7 +960,7 @@ impl DbManager {
                 }
                 total_tables += tables.len();
             }
-            info!("✅ 已标记 {} 个消息表为已读 (跨 {} 个数据库)", total_tables, conn_arcs.len());
+            info!("[ok] 已标记 {} 个消息表为已读 (跨 {} 个数据库)", total_tables, conn_arcs.len());
             Ok(watermarks)
         }).await??;
 
@@ -967,7 +981,7 @@ impl DbManager {
     pub async fn verify_sent(&self, text: &str, mut sent_rx: tokio::sync::broadcast::Receiver<String>) -> Result<bool> {
         let text_owned = text.to_string();
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + SEND_VERIFY_TIMEOUT;
         loop {
             tokio::select! {
                 result = sent_rx.recv() => {
@@ -978,19 +992,19 @@ impl DbManager {
                                 content_trimmed.contains(&text_owned)
                                 || text_owned.contains(content_trimmed)
                             ) {
-                                info!("✅ [DB] 发送验证成功");
+                                info!("[ok] [DB] 发送验证成功");
                                 return Ok(true);
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            warn!("⚠️ [DB] 自发消息广播通道已关闭");
+                            warn!("[warn] [DB] 自发消息广播通道已关闭");
                             break;
                         }
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    warn!("⚠️ [DB] 发送验证超时 (5s)");
+                    warn!("[warn] [DB] 发送验证超时 (5s)");
                     break;
                 }
             }
@@ -1021,7 +1035,7 @@ impl DbManager {
 
         std::thread::spawn(move || {
             if let Err(e) = wal_watch_loop(&db_dir, wal_tx) {
-                error!("❌ WAL 监听退出: {}", e);
+                error!("[err] WAL 监听退出: {}", e);
             }
         });
 
@@ -1043,7 +1057,7 @@ fn resolve_chat_from_table(table_name: &str, conn: &Connection, cache: &mut Hash
         if let Ok(id) = suffix.parse::<i64>() {
             let sql = "SELECT user_name FROM Name2Id WHERE rowid = ?1";
             if let Ok(name) = conn.query_row(sql, [id], |row| row.get::<_, String>(0)) {
-                debug!("✅ ChatMsg rowid={} -> {}", id, name);
+                debug!("[ok] ChatMsg rowid={} -> {}", id, name);
                 return name;
             }
         }
@@ -1064,18 +1078,18 @@ fn resolve_chat_from_table(table_name: &str, conn: &Connection, cache: &mut Hash
                     }
                 }
             }
-            debug!("📦 Name2Id 缓存已构建: {} 条", cache.len());
+            debug!("[db] Name2Id 缓存已构建: {} 条", cache.len());
         }
 
         // O(1) 查找
         if let Some(name) = cache.get(hash) {
-            debug!("✅ Msg hash={} -> user_name={}", hash, name);
+            debug!("[ok] Msg hash={} -> user_name={}", hash, name);
             return name.clone();
         }
-        debug!("⚠️ hash={} 未在 Name2Id 中找到匹配", hash);
+        debug!("[warn] hash={} 未在 Name2Id 中找到匹配", hash);
     }
 
-    debug!("⚠️ 无法解析会话名: {}", table_name);
+    debug!("[warn] 无法解析会话名: {}", table_name);
     table_name.to_string()
 }
 
@@ -1093,9 +1107,9 @@ fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Resu
 
     // 等待 message 目录创建 (轮询, 仅启动时执行一次)
     if !msg_dir.exists() {
-        info!("⏳ 等待 message 目录创建: {}", msg_dir.display());
+        info!("[wait] 等待 message 目录创建: {}", msg_dir.display());
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(WAL_POLL_INTERVAL);
             if msg_dir.exists() {
                 info!("📁 message 目录已创建");
                 break;
@@ -1106,9 +1120,9 @@ fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Resu
     // 等待 WAL 文件创建 (轮询)
     let wal_path = msg_dir.join("message_0.db-wal");
     if !wal_path.exists() {
-        info!("⏳ 等待 WAL 文件: {}", wal_path.display());
+        info!("[wait] 等待 WAL 文件: {}", wal_path.display());
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(WAL_POLL_INTERVAL);
             if wal_path.exists() {
                 info!("📄 WAL 文件已创建");
                 break;
@@ -1150,7 +1164,7 @@ fn wal_watch_loop(db_dir: &Path, tx: tokio::sync::broadcast::Sender<()>) -> Resu
             }
 
             // 外部进程修改了消息数据库文件 → 触发消息检查
-            trace!("📝 外部 MODIFY (pid={}): {}", event.pid, event.path);
+            trace!("外部 MODIFY (pid={}): {}", event.pid, event.path);
             has_external_modify = true;
         }
 
@@ -1171,7 +1185,7 @@ fn decompress_wcdb_content(blob: &[u8]) -> String {
     if blob.len() >= 4 && blob[0] == 0x28 && blob[1] == 0xB5 && blob[2] == 0x2F && blob[3] == 0xFD {
         match zstd::decode_all(blob) {
             Ok(data) => return String::from_utf8_lossy(&data).to_string(),
-            Err(e) => warn!("⚠️ Zstd 解压失败: {}", e),
+            Err(e) => warn!("[warn] Zstd 解压失败: {}", e),
         }
     }
     // 非 Zstd: 直接 lossy UTF-8

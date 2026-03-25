@@ -37,7 +37,7 @@ impl ChatWnd {
     ///
     /// `window_node` 应该是 AT-SPI2 树中该独立窗口的 frame 节点
     pub fn new(who: String, atspi: Arc<AtSpi>, window_node: NodeRef) -> Self {
-        info!("📌 创建 ChatWnd: {who}");
+        info!("[pin] 创建 ChatWnd: {who}");
         Self {
             who,
             atspi,
@@ -79,10 +79,10 @@ impl ChatWnd {
                 SearchAction::Recurse
             }
         }, 0, 15, 30).await {
-            info!("📌 [ChatWnd] 缓存输入框节点: {}", self.who);
+            info!("[pin] [ChatWnd] 缓存输入框节点: {}", self.who);
             self.edit_box_node = Some(node);
         } else {
-            info!("📌 [ChatWnd] 未找到输入框, 将使用偏移量方案: {}", self.who);
+            info!("[pin] [ChatWnd] 未找到输入框, 将使用偏移量方案: {}", self.who);
         }
     }
 
@@ -101,10 +101,10 @@ impl ChatWnd {
                 SearchAction::Recurse
             }
         }, 0, 15, 30).await {
-            info!("📌 [ChatWnd] 缓存消息列表节点: {}", self.who);
+            info!("[pin] [ChatWnd] 缓存消息列表节点: {}", self.who);
             self.msg_list_node = Some(node);
         } else {
-            info!("📌 [ChatWnd] 未找到消息列表: {}", self.who);
+            info!("[pin] [ChatWnd] 未找到消息列表: {}", self.who);
         }
     }
 
@@ -140,7 +140,7 @@ impl ChatWnd {
         text: &str,
         skip_verify: bool,
     ) -> Result<(bool, bool, String)> {
-        info!("📤 [ChatWnd] 发送: [{}] → {text}", self.who);
+        info!("[send] [ChatWnd] 发送: [{}] → {text}", self.who);
 
         // 1. 激活窗口并聚焦输入框
         self.activate_and_focus_input(engine).await?;
@@ -155,14 +155,14 @@ impl ChatWnd {
 
         // 4. 验证发送 (可跳过, 由 API 层的 DB 验证替代)
         let verified = if skip_verify {
-            debug!("⏩ [ChatWnd] 跳过 AT-SPI 验证 (将由 DB 验证): [{}]", self.who);
+            debug!("[skip] [ChatWnd] 跳过 AT-SPI 验证 (将由 DB 验证): [{}]", self.who);
             false
         } else {
             self.verify_sent(text).await
         };
 
         let msg = if verified { "消息已发送" } else { "消息已发送 (未验证)" };
-        info!("✅ [ChatWnd] 完成: [{}] verified={verified}", self.who);
+        info!("[ok] [ChatWnd] 完成: [{}] verified={verified}", self.who);
         Ok((true, verified, msg.into()))
     }
 
@@ -175,7 +175,7 @@ impl ChatWnd {
         engine: &mut InputEngine,
         image_path: &str,
     ) -> Result<(bool, bool, String)> {
-        info!("🖼️ [ChatWnd] 发送图片: [{}] → {image_path}", self.who);
+        info!("[img] [ChatWnd] 发送图片: [{}] → {image_path}", self.who);
 
         // 1. 激活窗口并聚焦输入框
         self.activate_and_focus_input(engine).await?;
@@ -188,7 +188,7 @@ impl ChatWnd {
         engine.press_enter().await?;
         tokio::time::sleep(ms(500)).await;
 
-        info!("✅ [ChatWnd] 图片发送完成: [{}]", self.who);
+        info!("[ok] [ChatWnd] 图片发送完成: [{}]", self.who);
         Ok((true, false, "图片已发送 (独立窗口)".into()))
     }
 
@@ -218,7 +218,7 @@ impl ChatWnd {
         if !edit_valid {
             // 缓存失效或未初始化 → 重新搜索
             if self.edit_box_node.is_some() {
-                debug!("🔄 [ChatWnd] 输入框缓存失效, 重新搜索: {}", self.who);
+                debug!("[retry] [ChatWnd] 输入框缓存失效, 重新搜索: {}", self.who);
             }
             self.edit_box_node = None;
             self.init_edit_box().await;
@@ -260,7 +260,7 @@ impl ChatWnd {
 
             if !cached_valid {
                 if self.msg_list_node.is_some() {
-                    debug!("🔄 [ChatWnd] 消息列表缓存失效, 重新搜索: {}", self.who);
+                    debug!("[retry] [ChatWnd] 消息列表缓存失效, 重新搜索: {}", self.who);
                 }
                 self.msg_list_node = None;
                 self.init_msg_list().await;

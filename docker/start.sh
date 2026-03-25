@@ -35,7 +35,7 @@ su - wechat -c '
 # 密钥提取监视器 (内存扫描方式, root 后台)
 # 等待微信登录后自动扫描进程内存提取数据库密钥
 # ============================================================
-if [ ! -f /tmp/wechat_key.txt ] && [ ! -f /home/wechat/.cache/wechat_key.txt ]; then
+if [ ! -f /tmp/wechat_key.txt ] && [ ! -f /home/wechat/.xwechat/wechat_key.txt ]; then
   setsid bash -c '
     echo "[extract_key] 密钥提取监视器启动 (内存扫描模式)"
     python3 /usr/local/bin/extract_key.py \
@@ -66,7 +66,7 @@ su - wechat << 'USEREOF'
   vncserver :1 -geometry 1280x720 -depth 24 -localhost no 2>&1 | tee /tmp/vnc_startup.log
   VNC_EXIT=${PIPESTATUS[0]}
   if [ "$VNC_EXIT" != "0" ]; then
-    echo "[start.sh] ⚠️ VNC 首次启动失败 (exit=$VNC_EXIT), 清理后重试..."
+    echo "[start.sh] [warn] VNC 首次启动失败 (exit=$VNC_EXIT), 清理后重试..."
     vncserver -kill :1 2>/dev/null || true
     rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 2>/dev/null || true
     sleep 2
@@ -77,9 +77,9 @@ su - wechat << 'USEREOF'
 
   # 验证 VNC 是否真正启动
   if [ -e /tmp/.X11-unix/X1 ]; then
-    echo "[start.sh] ✅ VNC 启动成功 (DISPLAY=:1)"
+    echo "[start.sh] [ok] VNC 启动成功 (DISPLAY=:1)"
   else
-    echo "[start.sh] ❌ VNC 启动失败! 后续服务可能不可用"
+    echo "[start.sh] [err] VNC 启动失败! 后续服务可能不可用"
     echo "[start.sh] VNC 日志:"
     cat /tmp/vnc_startup.log 2>/dev/null || true
   fi
@@ -111,9 +111,9 @@ su - wechat << 'USEREOF'
     | grep string | sed 's/.*"\(.*\)"/\1/')
   if [ -n "$A11Y_ADDR" ]; then
     export AT_SPI_BUS_ADDRESS="$A11Y_ADDR"
-    echo "[start.sh] ✅ AT-SPI2 bus: $A11Y_ADDR"
+    echo "[start.sh] [ok] AT-SPI2 bus: $A11Y_ADDR"
   else
-    echo "[start.sh] ⚠️ AT-SPI2 bus address not found"
+    echo "[start.sh] [warn] AT-SPI2 bus address not found"
   fi
 
   # 保存环境变量 (供 docker exec 使用, 用 echo 避免嵌套 heredoc)
@@ -131,14 +131,14 @@ su - wechat << 'USEREOF'
   wechat --no-sandbox --disable-gpu > /tmp/wechat_stdout.log 2>&1 &
   WECHAT_PID=$!
   echo $WECHAT_PID > /tmp/wechat.pid
-  echo "[start.sh] ✅ 微信已启动 (PID: $WECHAT_PID)"
+  echo "[start.sh] [ok] 微信已启动 (PID: $WECHAT_PID)"
   # 等待微信窗口就绪 (轮询替代固定 sleep, 最多 60 秒)
   echo "[start.sh] 等待微信窗口就绪..."
   for _wait in $(seq 1 30); do
     # 检查微信窗口 (替代 xdotool, 使用进程窗口检测)
     if pgrep -x wechat >/dev/null 2>&1 && \
        xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -q "0x"; then
-      echo "[start.sh] ✅ 微信窗口已就绪 (${_wait}x2s)"
+      echo "[start.sh] [ok] 微信窗口已就绪 (${_wait}x2s)"
       break
     fi
     sleep 2
@@ -146,16 +146,16 @@ su - wechat << 'USEREOF'
 
   # 验证微信是否存活
   if kill -0 $WECHAT_PID 2>/dev/null; then
-    echo "[start.sh] ✅ 微信进程存活"
+    echo "[start.sh] [ok] 微信进程存活"
   else
-    echo "[start.sh] ❌ 微信进程已退出! 日志:"
+    echo "[start.sh] [err] 微信进程已退出! 日志:"
     cat /tmp/wechat_stdout.log 2>/dev/null | tail -20
   fi
 
   # 7) noVNC
   echo "[start.sh] 启动 noVNC..."
   websockify --web /usr/share/novnc 6080 localhost:5901 &
-  echo "[start.sh] ✅ noVNC 已启动"
+  echo "[start.sh] [ok] noVNC 已启动"
 
   # 环境变量已保存到 ~/.dbus_env (供 MimicWX 使用)
 USEREOF
@@ -179,9 +179,9 @@ while true; do
   '
   EXIT_CODE=$?
   if [ "$EXIT_CODE" = "42" ]; then
-    echo "[start.sh] 🔄 MimicWX 重启中 (3秒后)..."
+    echo "[start.sh] [retry] MimicWX 重启中 (3秒后)..."
     sleep 3
-    echo "[start.sh] 🔄 重新启动 MimicWX..."
+    echo "[start.sh] [retry] 重新启动 MimicWX..."
     continue
   fi
   echo "[start.sh] MimicWX 已退出 (code=$EXIT_CODE)"

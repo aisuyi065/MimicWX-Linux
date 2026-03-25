@@ -29,6 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utils
 anyhow = "1"
+arc-swap = "1"
 md5 = "0.7"
 quick-xml = "0.37"
 zstd = "0.13"

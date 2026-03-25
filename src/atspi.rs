@@ -27,6 +27,12 @@ const IFACE_TEXT: &str = "org.a11y.atspi.Text";
 const PROPS: &str = "org.freedesktop.DBus.Properties";
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+// 树遍历限制
+const MAX_TREE_DEPTH: u32 = 20;
+const MAX_CHILDREN_PER_NODE: i32 = 20;
+const MAX_BFS_NODES: usize = 500;
+const MAX_DUMP_NODES: u32 = 200;
+
 // =====================================================================
 // 类型
 // =====================================================================
@@ -87,7 +93,7 @@ impl AtSpi {
         // 最终回退: 标准连接 (可能后续 WeChat 启动后会注册上来)
         let a11y = atspi::AccessibilityConnection::new().await?;
         let conn = a11y.connection().clone();
-        info!("🔗 AT-SPI2 连接就绪 (标准发现, 等待应用注册)");
+        info!("[conn] AT-SPI2 连接就绪 (标准发现, 等待应用注册)");
         Ok(Self { conn: RwLock::new(conn) })
     }
 
@@ -103,7 +109,7 @@ impl AtSpi {
             if !addr.is_empty() {
                 debug!("尝试 AT_SPI_BUS_ADDRESS: {addr}");
                 if let Some(instance) = Self::connect_to_address(&addr).await {
-                    info!("🔗 AT-SPI2 连接就绪 (AT_SPI_BUS_ADDRESS)");
+                    info!("[conn] AT-SPI2 连接就绪 (AT_SPI_BUS_ADDRESS)");
                     return Some(instance);
                 }
             }
@@ -116,7 +122,7 @@ impl AtSpi {
             if let Some(root) = Self::registry() {
                 let count = instance.child_count(&root).await;
                 if count > 1 {
-                    info!("🔗 AT-SPI2 连接就绪 (标准发现, {count} 个应用)");
+                    info!("[conn] AT-SPI2 连接就绪 (标准发现, {count} 个应用)");
                     return Some(instance);
                 }
                 debug!("标准连接只有 {count} 个子节点");
@@ -125,7 +131,7 @@ impl AtSpi {
 
         // 方法4: 扫描 socket 文件
         if let Some(instance) = Self::scan_bus_sockets().await {
-            info!("🔗 AT-SPI2 连接就绪 (扫描发现)");
+            info!("[conn] AT-SPI2 连接就绪 (扫描发现)");
             return Some(instance);
         }
 
@@ -215,7 +221,7 @@ impl AtSpi {
             let count = instance.child_count(&root).await;
             debug!("  bus {socket_path} 有 {count} 个子节点");
             if count > 0 {
-                info!("🔗 找到有效 AT-SPI2 bus: {socket_path} ({count} 个应用)");
+                info!("[conn] 找到有效 AT-SPI2 bus: {socket_path} ({count} 个应用)");
                 return Some(instance);
             }
         }
@@ -229,7 +235,7 @@ impl AtSpi {
     ///
     /// 当 Registry 持续返回 0 个子节点时调用此方法。
     pub async fn reconnect(&self) -> bool {
-        info!("🔄 尝试重新发现 AT-SPI2 bus...");
+        info!("[retry] 尝试重新发现 AT-SPI2 bus...");
 
         // 尝试通过 org.a11y.Bus 获取最新地址
         if let Some(new_conn) = Self::connect_via_a11y_bus().await {
@@ -241,7 +247,7 @@ impl AtSpi {
                 if count > 0 {
                     let mut conn = self.conn.write().await;
                     *conn = new_inner;
-                    info!("🔄 重连成功 (org.a11y.Bus, {count} 个应用)");
+                    info!("[retry] 重连成功 (org.a11y.Bus, {count} 个应用)");
                     return true;
                 }
             }
@@ -252,11 +258,11 @@ impl AtSpi {
             let new_inner = new_conn.conn.read().await.clone();
             let mut conn = self.conn.write().await;
             *conn = new_inner;
-            info!("🔄 重连成功 (socket 扫描)");
+            info!("[retry] 重连成功 (socket 扫描)");
             return true;
         }
 
-        debug!("🔄 重连未发现新的有效 bus");
+        debug!("[retry] 重连未发现新的有效 bus");
         false
     }
 
@@ -308,7 +314,7 @@ impl AtSpi {
             if let Some(root) = Self::registry() {
                 let count = instance.child_count(&root).await;
                 if count > 1 {
-                    info!("🔗 找到有效 AT-SPI2 bus: {path_str} ({count} 个应用)");
+                    info!("[conn] 找到有效 AT-SPI2 bus: {path_str} ({count} 个应用)");
                     return Some(instance);
                 }
                 debug!("  bus {path_str} 只有 {count} 个子节点, 跳过");
@@ -368,6 +374,11 @@ impl AtSpi {
         ).await;
         reply.and_then(|r| r.body().deserialize::<String>().ok())
             .unwrap_or_default()
+    }
+
+    /// 并发获取 role + name (2 次 D-Bus 调用并行而非串行)
+    pub async fn role_and_name(&self, node: &NodeRef) -> (String, String) {
+        tokio::join!(self.role(node), self.name(node))
     }
 
     pub async fn bbox(&self, node: &NodeRef) -> Option<BBox> {
@@ -457,7 +468,7 @@ impl AtSpi {
         &self, root: &NodeRef,
         matcher: impl Fn(&str, &str) -> bool,
     ) -> Option<NodeRef> {
-        self.find_bfs_limited(root, &matcher, 500).await
+        self.find_bfs_limited(root, &matcher, MAX_BFS_NODES).await
     }
 
     /// BFS 查找节点 — 带节点数量上限
@@ -469,18 +480,17 @@ impl AtSpi {
         let mut frontier = vec![root.clone()];
         let mut visited = 0usize;
 
-        for _depth in 0..20 {
+        for _depth in 0..MAX_TREE_DEPTH {
             if frontier.is_empty() { return None; }
             let mut next = Vec::new();
 
             for node in &frontier {
                 let count = self.child_count(node).await;
-                for i in 0..count.min(20) {
+                for i in 0..count.min(MAX_CHILDREN_PER_NODE) {
                     visited += 1;
                     if visited > max_nodes { return None; }
                     if let Some(child) = self.child_at(node, i).await {
-                        let role = self.role(&child).await;
-                        let name = self.name(&child).await;
+                        let (role, name) = self.role_and_name(&child).await;
                         if matcher(&role, &name) {
                             return Some(child);
                         }
@@ -512,8 +522,7 @@ impl AtSpi {
             let count = self.child_count(node).await;
             for i in 0..count.min(max_children) {
                 if let Some(child) = self.child_at(node, i).await {
-                    let role = self.role(&child).await;
-                    let name = self.name(&child).await;
+                    let (role, name) = self.role_and_name(&child).await;
                     match matcher(&role, &name) {
                         SearchAction::Found => return Some(child),
                         SearchAction::Recurse => {
@@ -548,12 +557,14 @@ impl AtSpi {
         out: &'a mut Vec<TreeNode>, count: &'a mut u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            if depth > max_depth || *count >= 200 { return; }
+            if depth > max_depth || *count >= MAX_DUMP_NODES { return; }
             *count += 1;
 
-            let role = self.role(node).await;
-            let name = self.name(node).await;
-            let children = self.child_count(node).await;
+            let (role, name, children) = tokio::join!(
+                self.role(node),
+                self.name(node),
+                self.child_count(node)
+            );
 
             out.push(TreeNode { depth, role: role.clone(), name: name.clone(), children });
 
@@ -562,8 +573,8 @@ impl AtSpi {
                 return;
             }
 
-            for i in 0..children.min(20) {
-                if *count >= 200 { return; }
+            for i in 0..children.min(MAX_CHILDREN_PER_NODE) {
+                if *count >= MAX_DUMP_NODES { return; }
                 if let Some(child) = self.child_at(node, i).await {
                     self.dump_dfs(&child, depth + 1, max_depth, out, count).await;
                 }
