@@ -8,15 +8,15 @@
 
 ## ✨ 特性
 
-- 🔍 **数据库消息检测** — SQLCipher 解密 WCDB + fanotify WAL 实时监听，亚秒级延迟，支持文本/图片/语音/视频/链接等 13+ 种消息类型解析
+- 🔍 **数据库消息检测** — SQLCipher 解密 WCDB + fanotify WAL 实时监听，亚秒级延迟，支持文本/图片/语音/视频/文件/名片/位置/链接等 16+ 种消息类型结构化解析
 - ⌨️ **X11 原生输入注入** — XTEST 扩展注入键鼠事件 + X11 Selection 协议直接操作剪贴板（零外部进程依赖），原生窗口管理
-- 🔑 **GDB 自动密钥提取** — 在 `setCipherKey` 偏移处设断点，扫码登录后自动从寄存器捕获 32 字节 AES 密钥
+- 🔑 **自动密钥提取** — 进程内存扫描 + HMAC 验证，扫码登录后自动提取 32 字节 AES 密钥，支持密钥过期自动更新
 - 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发 + 缓存节点自动失效重建
 - 🔌 **REST + WebSocket API** — 完整 HTTP API + WebSocket 实时推送 (30s 心跳保活)，CORS 全开放，可对接 Yunzai 等机器人框架
 - 🐳 **Docker 一键部署** — 多阶段构建 + Xvfb/VNC 虚拟桌面，开箱即用
 - 🔒 **Token 认证** — 支持 Bearer Token 认证保护 API 安全
 - 🖥️ **交互式控制台** — 支持 `/restart`、`/stop`、`/status`、`/refresh`、`/help` 命令，方向键切换历史
-- 💡 **自动弹性** — AT-SPI2 心跳自动重连、联系人定时刷新、优雅重启/关闭
+- 💡 **自动弹性** — AT-SPI2 心跳自动重连、密钥过期自愈、独立窗口弹出重试、联系人定时刷新、优雅重启/关闭
 
 ---
 
@@ -123,12 +123,12 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 
 | 能力 | 说明 |
 |------|------|
-| **SQLCipher 解密** | `rusqlite` + `bundled-sqlcipher-vendored-openssl`，使用 GDB 提取的密钥 |
+| **SQLCipher 解密** | `rusqlite` + `bundled-sqlcipher-vendored-openssl`，密钥过期自动检测 + 重新初始化 |
 | **持久连接池** | 多个 `message_N.db` 保持长连接，避免重复解密握手 |
 | **WAL 监听** | `fanotify` + PID 过滤 (只监听微信进程写入)，无需防抖 |
 | **增量消息** | 每个消息表维护 `last_local_id` 高水位标记 |
 | **联系人缓存** | 从 `contact.db` + `group_contact.db` 加载联系人/群成员 |
-| **消息解析** | 支持文本/图片/语音/视频/表情/名片/链接/小程序/文件/转账/红包/系统消息 |
+| **消息解析** | 16+ 种结构化类型：文本/图片(含尺寸)/语音(含CDN+AES)/视频(含元数据)/文件(含大小)/名片/位置/表情/链接/小程序/转账/红包/系统消息 |
 | **WCDB 兼容** | Zstd BLOB 解压 + TEXT/BLOB 自适应读取 |
 | **发送验证** | 订阅自发消息广播，事件驱动验证发送结果 |
 
@@ -143,7 +143,7 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 | **会话管理** | 列表获取 / 精确匹配优先切换 / 新消息检查 / Ctrl+F 搜索回退 |
 | **消息发送** | 公共方法提取 → 切换会话 → 粘贴文本 → Enter → DB 验证 |
 | **图片发送** | 优先独立窗口，回退主窗口 |
-| **独立窗口** | 弹出 (`add_listen`) / 关闭 (`remove_listen`) / 存活检测 |
+| **独立窗口** | 弹出 (`add_listen`, 3 次重试 + 递增退避) / 关闭 (`remove_listen`) / 存活检测 |
 
 ### `chatwnd.rs` — 独立聊天窗口
 
@@ -271,25 +271,21 @@ export MIMICWX_TOKEN="your-secret-token"         # 认证 Token
 WeChat 进程启动
       │
       ▼
-GDB attach (start.sh 自动触发)
+extract_key.py (root 后台, start.sh 自动启动)
+      │
+      ├── 已有密钥? → HMAC 验证 → 有效 → 跳过提取 (秒退)
+      │                          → 无效 → 继续等待
+      ▼
+扫描 /proc/<PID>/maps + mem (无限等待用户扫码)
       │
       ▼
-在 setCipherKey 偏移 (0x6586C90) 设断点
+提取 32 字节 AES 密钥 → HMAC 验证 → 保存至 wechat_key.txt + wechat_keys.json
       │
       ▼
-用户扫码登录 → 微信调用 setCipherKey 打开数据库
-      │
-      ▼
-断点触发 → 从 $rsi 寄存器读取 Data 结构体
-      │
-      ▼
-提取 32 字节 AES 密钥 → 保存至 /tmp/wechat_key.txt
-      │
-      ▼
-GDB detach → 微信正常运行 → MimicWX 读取密钥 → 解密数据库
+MimicWX 检测密钥文件 → 解密数据库 → 密钥过期时监控 mtime 自动重新初始化
 ```
 
-> ⚠️ 密钥偏移量 `0x6586C90` 对应 WeChat Linux 4.1.0.16 版本，升级微信后可能需要更新。
+> 💡 密钥提取基于进程内存扫描 + HMAC 验证，不依赖特定偏移量，微信版本升级无需更新。
 
 ---
 
@@ -406,6 +402,18 @@ ws.onmessage = (e) => console.log(JSON.parse(e.data))
 ---
 
 ## 📋 更新日志
+
+### v0.5.2
+
+- 📊 **消息类型结构化升级** — Image/Voice/Video 扩展完整元数据 (CDN URL、AES 密钥、尺寸、文件大小)
+- 📎 **新增 File 类型** — 从 App 中独立出文件消息，支持 app_type=6/74 + totallen 组合判定
+- 👤 **新增 ContactCard 类型** — 名片消息独立解析 (nickname/username/avatar_url)
+- 📍 **新增 Location 类型** — 位置消息解析 (经纬度/名称/地址)
+- 🔑 **密钥生命周期自愈** — 密钥过期自动检测 + 监控 mtime 变化 + 重新初始化 DbManager
+- 🔄 **add_listen 重试机制** — 独立窗口弹出失败时最多重试 3 次 (递增退避 1s/1.5s/2s)
+- 🔍 **extract_key.py 增强** — HMAC 验证快速跳过 + 移除超时限制 (无限等待扫码)
+- 🔌 **AT-SPI 定期重连** — 等待登录时每 15s 尝试重连 (防止容器重启后 bus 地址变化)
+- 🐳 **start.sh 健壮性** — 始终启动密钥提取 + /restart 时清除旧密钥重新提取
 
 ### v0.5.1
 

@@ -182,8 +182,61 @@ def save_keys(matched, all_keys):
             with open(kpath, 'w') as f:
                 f.write(first_key['raw_key'])
 
+def validate_existing_keys():
+    """检查已有密钥是否仍然有效 (HMAC 验证)"""
+    if not os.path.exists(KEY_JSON_FILE):
+        return False
+    try:
+        with open(KEY_JSON_FILE, 'r') as f:
+            mapping = json.load(f)
+    except:
+        return False
+    if not mapping:
+        return False
+
+    db_dir = find_db_dir()
+    if not db_dir:
+        return False
+
+    # 验证每个已缓存的 DB 密钥
+    valid = 0
+    invalid = 0
+    for rel_path, raw_key in mapping.items():
+        db_path = os.path.join(db_dir, rel_path)
+        if not os.path.exists(db_path):
+            continue
+        enc_key_hex = raw_key[:64]
+        if verify_key_for_db(db_path, enc_key_hex):
+            valid += 1
+        else:
+            invalid += 1
+
+    if invalid > 0:
+        print(f"[extract_key] [warn] 已有密钥验证: {valid} 通过, {invalid} 失败 — 需要重新提取")
+        return False
+
+    if valid == 0:
+        return False
+
+    print(f"[extract_key] [ok] 已有密钥验证通过 ({valid} 个), 跳过重新提取")
+    # 确保兼容路径也有密钥文件
+    if os.path.exists(KEY_FILE):
+        for compat in [KEY_FILE_COMPAT, KEY_JSON_COMPAT]:
+            src = KEY_FILE if compat == KEY_FILE_COMPAT else KEY_JSON_FILE
+            try:
+                import shutil
+                shutil.copy2(src, compat)
+            except:
+                pass
+    return True
+
+
 def main():
     print("[extract_key] [key] 微信密钥提取脚本启动 (内存扫描 + HMAC 验证)")
+
+    # 快速路径: 已有密钥仍然有效 → 直接使用
+    if validate_existing_keys():
+        return
 
     pid = None
     for _ in range(60):
@@ -200,7 +253,7 @@ def main():
     print("[extract_key] [login] 请通过 noVNC (http://localhost:6080/vnc.html) 扫码登录微信")
 
     start_time = time.time()
-    while time.time() - start_time < MAX_WAIT:
+    while True:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -254,9 +307,6 @@ def main():
                     with open(kpath, 'w') as f:
                         f.write(keys[0]['raw_key'])
                 return
-
-    print(f"[extract_key] [err] 超时 ({MAX_WAIT}s), 未找到密钥")
-    sys.exit(1)
 
 def rescan_for_new_dbs(pid, db_dir, initial_matched):
     """延迟重扫: 监控 db_storage 30s, 有新 .db 就重新提取并匹配"""

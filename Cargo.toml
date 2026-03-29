@@ -1,6 +1,6 @@
 [package]
 name = "mimicwx"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Zero-risk WeChat automation framework for Linux via AT-SPI2 + X11 XTEST + SQLCipher"
 license = "MIT"

@@ -98,6 +98,11 @@ async fn main() -> Result<()> {
                     info!("[key] GDB 密钥提取已在后台运行, 登录后将自动获取数据库密钥");
                     login_prompted = true;
                 }
+                // 定期重连 AT-SPI (容器重启后 bus 地址可能变化)
+                attempts += 1;
+                if attempts % 5 == 4 {
+                    wechat.try_reconnect().await;
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
             _ => {
@@ -107,14 +112,15 @@ async fn main() -> Result<()> {
     }
 
     // ⑥ 读取数据库密钥 (内存扫描提取) + 初始化 DbManager
-    // 优先检查持久化路径, 回退到 /tmp (兼容)
+    // extract_key.py 在后台持续运行 (由 start.sh 以 root 启动, 无超时)
+    // 这里只需等待密钥文件出现
     let key_paths = ["/home/wechat/.xwechat/wechat_key.txt", "/tmp/wechat_key.txt"];
-    for i in 0..10 {
+    for i in 0..60 {
         if key_paths.iter().any(|p| std::path::Path::new(p).exists()) {
             break;
         }
         if i == 0 {
-            info!("[key] 等待密钥提取...");
+            info!("[key] 等待 extract_key.py 提取密钥...");
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -134,9 +140,10 @@ async fn main() -> Result<()> {
                 let db_dir = find_db_dir();
                 match db_dir {
                     Some(dir) => {
+                        let dir_for_retry = dir.clone();
                         match db::DbManager::new(key, dir) {
                             Ok(mgr) => {
-                                let mgr = Arc::new(mgr);
+                                let mut final_mgr = Arc::new(mgr);
                                 // 等待微信创建消息数据库后再标记已读
                                 // 首次登录时 message_N.db 可能尚未创建, 需要重试等待
                                 let mark_ok = {
@@ -144,7 +151,7 @@ async fn main() -> Result<()> {
                                     for attempt in 0..10 {
                                         let wait = if attempt == 0 { 5 } else { 3 };
                                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                                        match mgr.mark_all_read().await {
+                                        match final_mgr.mark_all_read().await {
                                             Ok(()) => { ok = true; break; }
                                             Err(e) => {
                                                 if attempt < 9 {
@@ -159,13 +166,43 @@ async fn main() -> Result<()> {
                                     ok
                                 };
                                 // 联系人加载 (在消息表就绪后执行, 或独立尝试)
-                                if let Err(e) = mgr.refresh_contacts().await {
+                                if let Err(e) = final_mgr.refresh_contacts().await {
                                     warn!("[warn] 联系人加载失败 (可能尚无数据): {}", e);
                                 }
+                                // 如果标记已读和联系人都失败, 可能是密钥过期
+                                // 等待 extract_key.py 产出新密钥, 重新初始化
                                 if !mark_ok {
-                                    info!("ℹ️ 消息数据库将在收到首条消息时自动连接");
+                                    info!("[key] 解密失败, 可能密钥过期 — 等待 extract_key.py 提取新密钥...");
+                                    let key_json = "/home/wechat/.xwechat/wechat_keys.json";
+                                    let old_mtime = std::fs::metadata(key_json)
+                                        .and_then(|m| m.modified()).ok();
+                                    for _ in 0..30 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                        let new_mtime = std::fs::metadata(key_json)
+                                            .and_then(|m| m.modified()).ok();
+                                        if new_mtime != old_mtime && new_mtime.is_some() {
+                                            info!("[key] 检测到新密钥, 重新初始化...");
+                                            let new_key = key_paths.iter()
+                                                .find_map(|p| std::fs::read_to_string(p).ok())
+                                                .unwrap_or_default().trim().to_string();
+                                            if !new_key.is_empty() {
+                                                match db::DbManager::new(new_key, dir_for_retry.clone()) {
+                                                    Ok(new_mgr) => {
+                                                        let new_mgr = Arc::new(new_mgr);
+                                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                                        let _ = new_mgr.mark_all_read().await;
+                                                        let _ = new_mgr.refresh_contacts().await;
+                                                        info!("[ok] 新密钥解密成功, DbManager 已重新初始化");
+                                                        final_mgr = new_mgr;
+                                                    }
+                                                    Err(e) => warn!("[warn] 新密钥也失败: {}", e),
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
                                 }
-                                Some(mgr)
+                                Some(final_mgr)
                             }
                             Err(e) => {
                                 warn!("[warn] DbManager 初始化失败: {}", e);

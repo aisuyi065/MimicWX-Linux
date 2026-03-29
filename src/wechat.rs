@@ -569,79 +569,106 @@ impl WeChat {
             return Ok(true);
         }
 
-        // 2. 点击主窗口确保聚焦 (避免被旧的独立窗口遮挡)
-        self.focus_main_window(engine).await;
+        // 2-4. 双击弹出独立窗口 (带重试, 最多 3 次)
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                info!("[listen] 第 {} 次重试添加监听: {who}", attempt + 1);
+                tokio::time::sleep(ms(1000 + attempt * 500)).await;
+            }
 
-        // 3. 切换到该聊天
-        self.chat_with(engine, who).await?;
+            // 2. 点击主窗口确保聚焦 (避免被旧的独立窗口遮挡)
+            self.focus_main_window(engine).await;
 
-        // 3. 在会话列表中找到该项并双击弹出独立窗口
-        if let Some(list) = self.find_session_list(&app).await {
-            if let Some(item) = self.find_session(&list, who).await {
-                if let Some(bbox) = self.atspi.bbox(&item).await {
-                    let (cx, cy) = bbox.center();
-                    engine.double_click(cx, cy).await?;
-                    debug!("[listen] 双击会话弹出独立窗口: ({cx}, {cy})");
-                    // 轮询等待独立窗口出现 (替代固定 1000ms)
-                    let appeared = wait_for(&self.atspi, &app, 2000, 100,
-                        |atspi, app| {
-                            let atspi = atspi.clone();
-                            let app = app.clone();
-                            let who_owned = who.to_string();
-                            async move {
-                                let count = atspi.child_count(&app).await;
-                                for i in 0..count.min(20) {
-                                    if let Some(child) = atspi.child_at(&app, i).await {
-                                        let role = atspi.role(&child).await;
-                                        let name = atspi.name(&child).await;
-                                        if role == "frame" && name.contains(&who_owned) && !is_wechat_main(&name) {
-                                            return true;
-                                        }
-                                    }
+            // 3. 切换到该聊天
+            if let Err(e) = self.chat_with(engine, who).await {
+                warn!("[listen] chat_with 失败 (attempt {}): {e}", attempt + 1);
+                continue;
+            }
+
+            // 3b. 在会话列表中找到该项并双击弹出独立窗口
+            let double_clicked = if let Some(list) = self.find_session_list(&app).await {
+                if let Some(item) = self.find_session(&list, who).await {
+                    if let Some(bbox) = self.atspi.bbox(&item).await {
+                        let (cx, cy) = bbox.center();
+                        engine.double_click(cx, cy).await?;
+                        debug!("[listen] 双击会话弹出独立窗口: ({cx}, {cy})");
+                        true
+                    } else { false }
+                } else {
+                    warn!("[listen] 未找到会话项: {who} (attempt {})", attempt + 1);
+                    false
+                }
+            } else {
+                warn!("[listen] 未找到会话列表 (attempt {})", attempt + 1);
+                false
+            };
+
+            if !double_clicked {
+                continue;
+            }
+
+            // 轮询等待独立窗口出现 (增加超时: 3000ms)
+            let appeared = wait_for(&self.atspi, &app, 3000, 100,
+                |atspi, app| {
+                    let atspi = atspi.clone();
+                    let app = app.clone();
+                    let who_owned = who.to_string();
+                    async move {
+                        let count = atspi.child_count(&app).await;
+                        for i in 0..count.min(20) {
+                            if let Some(child) = atspi.child_at(&app, i).await {
+                                let role = atspi.role(&child).await;
+                                let name = atspi.name(&child).await;
+                                if role == "frame" && name.contains(&who_owned) && !is_wechat_main(&name) {
+                                    return true;
                                 }
-                                false
                             }
                         }
-                    ).await;
-                    debug!("[listen] 独立窗口弹出: {}", if appeared { "已检测到" } else { "超时" });
-                    // 双击弹出独立窗口后, 主窗口状态已变, 重置 current_chat
-                    *self.current_chat.lock().await = None;
-                }
-            }
-        }
-
-        // 4. 查找新弹出的独立窗口 — 轮询 (替代固定 3×1500ms 重试)
-        let wnd_node = wait_for_result(&self.atspi, &app, 5000, 200,
-            |atspi, app| {
-                let atspi = atspi.clone();
-                let app = app.clone();
-                let who_owned = who.to_string();
-                async move {
-                    let count = atspi.child_count(&app).await;
-                    for i in 0..count.min(20) {
-                        if let Some(child) = atspi.child_at(&app, i).await {
-                            let role = atspi.role(&child).await;
-                            let name = atspi.name(&child).await;
-                            if role == "frame" && name.contains(&who_owned) && !is_wechat_main(&name) {
-                                return Some(child);
-                            }
-                        }
+                        false
                     }
-                    None
                 }
-            }
-        ).await;
+            ).await;
+            debug!("[listen] 独立窗口弹出: {}", if appeared { "已检测到" } else { "超时" });
+            // 双击弹出独立窗口后, 主窗口状态已变, 重置 current_chat
+            *self.current_chat.lock().await = None;
 
-        if let Some(wnd_node) = wnd_node {
-            let mut chatwnd = ChatWnd::new(who.to_string(), self.atspi.clone(), wnd_node);
-            chatwnd.init_edit_box().await;
-            chatwnd.init_msg_list().await;
-            let mut windows = self.listen_windows.lock().await;
-            windows.insert(who.to_string(), chatwnd);
-            info!("[listen] 成功添加监听: {who}");
-            return Ok(true);
+            // 4. 查找新弹出的独立窗口 — 轮询 (增加超时: 6000ms)
+            let wnd_node = wait_for_result(&self.atspi, &app, 6000, 200,
+                |atspi, app| {
+                    let atspi = atspi.clone();
+                    let app = app.clone();
+                    let who_owned = who.to_string();
+                    async move {
+                        let count = atspi.child_count(&app).await;
+                        for i in 0..count.min(20) {
+                            if let Some(child) = atspi.child_at(&app, i).await {
+                                let role = atspi.role(&child).await;
+                                let name = atspi.name(&child).await;
+                                if role == "frame" && name.contains(&who_owned) && !is_wechat_main(&name) {
+                                    return Some(child);
+                                }
+                            }
+                        }
+                        None
+                    }
+                }
+            ).await;
+
+            if let Some(wnd_node) = wnd_node {
+                let mut chatwnd = ChatWnd::new(who.to_string(), self.atspi.clone(), wnd_node);
+                chatwnd.init_edit_box().await;
+                chatwnd.init_msg_list().await;
+                let mut windows = self.listen_windows.lock().await;
+                windows.insert(who.to_string(), chatwnd);
+                info!("[listen] 成功添加监听: {who}");
+                return Ok(true);
+            }
+
+            warn!("[listen] 第 {} 次双击未弹出独立窗口, {}", attempt + 1,
+                if attempt < 2 { "将重试..." } else { "已达最大重试次数" });
         }
-        warn!("[listen] 轮询超时后仍未找到独立窗口: {who}");
+
+        warn!("[listen] 添加监听失败 (3 次重试均未成功): {who}");
         Ok(false)
     }
 

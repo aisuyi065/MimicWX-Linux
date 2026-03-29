@@ -35,14 +35,13 @@ su - wechat -c '
 # 密钥提取监视器 (内存扫描方式, root 后台)
 # 等待微信登录后自动扫描进程内存提取数据库密钥
 # ============================================================
-if [ ! -f /tmp/wechat_key.txt ] && [ ! -f /home/wechat/.xwechat/wechat_key.txt ]; then
-  setsid bash -c '
+# 始终启动: extract_key.py 自带 HMAC 验证, 密钥有效时秒退
+setsid bash -c '
     echo "[extract_key] 密钥提取监视器启动 (内存扫描模式)"
     python3 /usr/local/bin/extract_key.py \
       > /tmp/extract_key.log 2>&1 || true
     echo "[extract_key] 密钥提取完成, 详见 /tmp/extract_key.log"
   ' &
-fi
 
 
 # ============================================================
@@ -181,6 +180,14 @@ while true; do
   if [ "$EXIT_CODE" = "42" ]; then
     echo "[start.sh] [retry] MimicWX 重启中 (3秒后)..."
     sleep 3
+
+    # ---- 重新提取密钥 (确保 /restart 后使用最新密钥) ----
+    echo "[start.sh] [retry] 重新提取数据库密钥..."
+    rm -f /home/wechat/.xwechat/wechat_key.txt /tmp/wechat_key.txt \
+          /home/wechat/.xwechat/wechat_keys.json /tmp/wechat_keys.json 2>/dev/null || true
+    python3 /usr/local/bin/extract_key.py > /tmp/extract_key.log 2>&1 || true
+    echo "[start.sh] [retry] 密钥提取完成"
+
     echo "[start.sh] [retry] 重新启动 MimicWX..."
     continue
   fi
